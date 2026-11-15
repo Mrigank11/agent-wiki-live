@@ -1,0 +1,168 @@
+import type * as Y from "yjs";
+import { diffEdits, merge3Text } from "./merge.ts";
+import { ORIGIN_DISK, type DiskPort, type Hooks, type LiveNote, type NoteRecord } from "./types.ts";
+
+/** Applies the smallest edits that turn the Y.Text into `to`, as one transaction: never delete-all-and-reinsert. */
+export function setText(doc: Y.Doc, text: Y.Text, to: string, origin: unknown = ORIGIN_DISK) {
+	const from = text.toString();
+	const edits = diffEdits(from, to);
+	if (!edits.length) return false;
+	doc.transact(() => {
+		for (let i = edits.length - 1; i >= 0; i--) {
+			const e = edits[i];
+			if (e.del) text.delete(e.pos, e.del);
+			if (e.ins) text.insert(e.pos, e.ins);
+		}
+	}, origin);
+	return true;
+}
+
+/**
+ * One note: keeps its file and its live text in agreement. `base` is the last text known to be on
+ * disk and live at once; every decision is a three-way merge against it. All calls are made one at a
+ * time by VaultSync, so nothing here races.
+ */
+export class NoteSync {
+	path: string;
+	base: string | null;
+	/** The last text we wrote to disk ourselves: the file event it causes is our own echo. */
+	private wrote: string | null = null;
+	private timer: ReturnType<typeof setTimeout> | null = null;
+	private off: () => void;
+	private dead = false;
+
+	readonly id: string;
+	readonly live: LiveNote;
+	private disk: DiskPort;
+	private hooks: Hooks;
+	/** Ask the owner to run `fn` in the vault's one-at-a-time queue. */
+	private enqueue: (fn: () => Promise<void>) => void;
+	/** Keep a person's text that cannot merge as a note of its own. */
+	private keepLocalCopy: (path: string, text: string) => Promise<void>;
+	private opts: { settleMs: number; readOnly: boolean; isOpen: (path: string) => boolean; changed: () => void };
+
+	constructor(
+		id: string,
+		record: NoteRecord | undefined,
+		live: LiveNote,
+		disk: DiskPort,
+		hooks: Hooks,
+		enqueue: (fn: () => Promise<void>) => void,
+		keepLocalCopy: (path: string, text: string) => Promise<void>,
+		opts: { settleMs: number; readOnly: boolean; isOpen: (path: string) => boolean; changed: () => void },
+	) {
+		this.id = id;
+		this.live = live;
+		this.disk = disk;
+		this.hooks = hooks;
+		this.enqueue = enqueue;
+		this.keepLocalCopy = keepLocalCopy;
+		this.opts = opts;
+		this.path = record?.path ?? "";
+		this.base = record ? record.base : null;
+		const obs = (_e: unknown, tr: Y.Transaction) => {
+			if (tr.origin === ORIGIN_DISK) return;
+			this.scheduleWrite();
+		};
+		live.text.observe(obs as any);
+		this.off = () => live.text.unobserve(obs as any);
+	}
+
+	get text() {
+		return this.live.text.toString();
+	}
+
+	record(): NoteRecord | null {
+		return this.base === null ? null : { path: this.path, base: this.base };
+	}
+
+	private scheduleWrite() {
+		if (this.dead) return;
+		if (this.timer) clearTimeout(this.timer);
+		const wait = this.opts.isOpen(this.path) ? this.opts.settleMs * 6 : this.opts.settleMs;
+		this.timer = setTimeout(() => {
+			this.timer = null;
+			this.enqueue(() => this.settle());
+		}, wait);
+	}
+
+	/** First attach and every later pass: look at the file and the live text and bring them together. */
+	async reconcile(path: string) {
+		this.path = path;
+		const disk = await this.disk.read(path);
+		await this.compare(disk);
+	}
+
+	/** The file changed (Obsidian's save, an outside write, a sync tool). */
+	async onDisk(disk: string | null) {
+		if (disk !== null && disk === this.wrote) {
+			this.wrote = null;
+			if (this.base === null || disk === this.text) this.adopt(disk);
+			return;
+		}
+		await this.compare(disk);
+	}
+
+	private adopt(text: string) {
+		if (this.base !== text) {
+			this.base = text;
+			this.opts.changed();
+		}
+	}
+
+	private async compare(disk: string | null) {
+		const live = this.text;
+		if (disk === null) return this.writeLive();
+		if (disk === live) return this.adopt(live);
+		if (this.opts.readOnly) return; // never push a read-only person's file edits into live text
+		if (this.base === null) return this.divergent(disk); // first attach, texts differ: nothing is overwritten
+		const m = merge3Text(this.base, disk, live);
+		if (!m.ok) return this.divergent(disk);
+		if (m.text !== live) setText(this.live.doc, this.live.text, m.text);
+		if (m.text === disk) return this.adopt(m.text);
+		// an open note is saved by Obsidian from the editor, which holds this text: write later, only if it does not
+		if (this.opts.isOpen(this.path)) return this.scheduleWrite();
+		await this.writeDisk(m.text);
+	}
+
+	/** The file and the live text both changed in the same place: live stays, the file's text is kept as its own note. */
+	private async divergent(disk: string) {
+		await this.keepLocalCopy(this.path, disk);
+		await this.writeDisk(this.text);
+	}
+
+	/** Remote changes settled: put the live text on disk unless an outside edit has to be merged first. */
+	async settle() {
+		if (this.dead) return;
+		const disk = await this.disk.read(this.path);
+		if (disk !== null && disk !== this.base && disk !== this.text) return this.compare(disk);
+		await this.writeLive(disk);
+	}
+
+	private async writeLive(known?: string | null) {
+		const live = this.text;
+		const disk = known === undefined ? await this.disk.read(this.path) : known;
+		if (disk === live) return this.adopt(live);
+		await this.writeDisk(live);
+	}
+
+	private async writeDisk(text: string) {
+		this.wrote = text;
+		await this.disk.write(this.path, text);
+		this.base = text;
+		this.opts.changed();
+	}
+
+	/** Where the file now is (a rename on either side). */
+	moved(path: string) {
+		this.path = path;
+		this.opts.changed();
+	}
+
+	destroy() {
+		this.dead = true;
+		if (this.timer) clearTimeout(this.timer);
+		this.off();
+		this.live.destroy();
+	}
+}

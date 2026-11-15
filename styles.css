@@ -1,0 +1,2 @@
+/* y-codemirror.next draws remote cursors with its own classes; nothing else to style yet. */
+.cm-ySelectionInfo { font-family: var(--font-interface); }
