@@ -120,6 +120,10 @@ export class HocuspocusRemote implements RemotePort {
 		this.socket.disconnect();
 	}
 	goOnline() {
+		// disconnect() only asks the socket to close. Until the close arrives the library still reports "connected",
+		// ignores connect() and has not set shouldConnect, so a goOnline() right after goOffline() would leave us
+		// offline for good. Setting it first makes the pending close reconnect on its own.
+		this.socket.shouldConnect = true;
 		void this.socket.connect();
 	}
 
