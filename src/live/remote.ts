@@ -2,9 +2,17 @@ import { HocuspocusProvider, HocuspocusProviderWebsocket } from "@hocuspocus/pro
 import * as Y from "yjs";
 import type { IndexEntry, LiveNote, RemotePort } from "../engine/types.ts";
 
+const B32 = "abcdefghijklmnopqrstuvwxyz234567";
+/** A fresh note id: 12 characters of base32, the shape the sync server accepts. */
+export function newNoteId(): string {
+	const b = crypto.getRandomValues(new Uint8Array(12));
+	return Array.from(b, (x) => B32[x & 31]).join("");
+}
+
 /** File-tree changes go through the gateway (the only writer of disk and git), which asks the sync server. */
 export interface FileOps {
-	create(path: string, text: string): Promise<{ path: string; clash?: boolean }>;
+	/** `id` is chosen by the caller, so a repeat of the same create (a retry, a double event) is the same note. */
+	create(path: string, text: string, id: string): Promise<{ path: string; clash?: boolean }>;
 	move(from: string, to: string): Promise<void>;
 	remove(path: string): Promise<void>;
 }
@@ -106,7 +114,7 @@ export class HocuspocusRemote implements RemotePort {
 	}
 
 	createFile(path: string, text: string) {
-		return this.o.fileOps.create(path, text);
+		return this.o.fileOps.create(path, text, newNoteId());
 	}
 	moveFile(from: string, to: string) {
 		return this.o.fileOps.move(from, to);

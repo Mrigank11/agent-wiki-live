@@ -128,8 +128,8 @@ export class Gateway {
 	fileOps(vault: string): FileOps {
 		const op = (body: unknown) => this.call<{ ok: boolean; path?: string; clash?: boolean }>("POST", `/vaults/${encodeURIComponent(vault)}/files`, body);
 		return {
-			create: async (path, text) => {
-				const r = await op({ op: "create", path, text });
+			create: async (path, text, id) => {
+				const r = await op({ op: "create", path, text, id });
 				return { path: r.path ?? path, clash: r.clash };
 			},
 			move: async (from, to) => void (await op({ op: "move", from, to })),

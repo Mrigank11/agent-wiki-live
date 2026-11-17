@@ -11,7 +11,16 @@ export type VaultSyncOptions = {
 	 * until it has had more use; the plugin never sets this.
 	 */
 	adoptExisting?: boolean;
+	/** Names this device in conflict copies ("laptop", "phone"). */
+	device?: string;
+	/** The clock for conflict copy names. */
+	now?: () => Date;
 };
+
+/** A note's name without what earlier conflicts or clashes added: a copy is always a copy of the note itself. */
+const SUFFIXES = /(?: \((?:conflict [^)]*|local copy(?: \d+)?|\d+)\))+$/;
+export const baseStem = (path: string) => path.replace(/\.md$/, "").replace(SUFFIXES, "");
+const pad = (n: number) => String(n).padStart(2, "0");
 
 export class NonEmptyFolderError extends Error {
 	constructor() {
@@ -37,6 +46,8 @@ export class VaultSync {
 	private readonly onIndex: (e: Y.YMapEvent<IndexEntry>, tr: Y.Transaction) => void;
 	/** Paths we are creating or moving ourselves, so the file event they raise is not taken as a person's edit. */
 	private quiet = new Set<string>();
+	/** What we wrote to files that were not yet notes (local copies): a file event for exactly this text is our own echo, whenever it arrives. */
+	private echoes = new Map<string, string>();
 
 	private disk: DiskPort;
 	private remote: RemotePort;
@@ -58,6 +69,20 @@ export class VaultSync {
 		};
 	}
 
+	private pausedUntil = 0;
+
+	/** Create a note on the server. When the server refuses a burst (429: something is creating copies in a loop), stop creating for a minute and say so once. */
+	private async createNote(path: string, text: string) {
+		if (Date.now() < this.pausedUntil) return;
+		try {
+			return await this.remote.createFile(path, text);
+		} catch (e) {
+			if ((e as { status?: number })?.status !== 429) throw e;
+			this.pausedUntil = Date.now() + 60_000;
+			this.hooks.notify({ kind: "error", message: "agent-wiki refused new notes because too many identical ones were being created in a row. The plugin has paused creating notes for a minute; if this repeats, disconnect and check for a loop." });
+		}
+	}
+
 	private enqueue(fn: () => Promise<void>) {
 		this.queue = this.queue.then(fn).catch((e) => this.hooks.log?.("engine error", String(e?.stack ?? e)));
 		return this.queue;
@@ -74,6 +99,8 @@ export class VaultSync {
 			await this.syncIndex(true);
 		});
 		this.remote.index.observe(this.onIndex as any);
+		// notes created during the first pass (files the server did not know) were not observed yet: attach them
+		await this.enqueue(() => this.syncIndex());
 	}
 
 	stop() {
@@ -115,15 +142,24 @@ export class VaultSync {
 		// files on disk the server does not know
 		for (const p of localPaths) {
 			if (claimed.has(p) || this.quiet.has(p)) continue;
+			if (this.echoes.has(p) && (await this.disk.read(p)) === this.echoes.get(p)) continue;
 			const was = Object.entries(this.records).find(([, r]) => r.path === p);
 			if (was && !entries.has(was[0])) {
-				// we knew it and the server forgot it entirely: treat as a new file
+				// We knew it and the server has forgotten it entirely (a deletion older than its tombstones). Unchanged
+				// here since: it was deleted while this device was away, so it goes. Edited here: the edit is kept as a new note.
 				delete this.records[was[0]];
+				const mine = await this.disk.read(p);
+				if (mine !== null && mine === was[1].base && !this.remote.readOnly) {
+					this.quiet.add(p);
+					await this.disk.remove(p);
+					this.quiet.delete(p);
+					continue;
+				}
 			}
 			if (this.remote.readOnly) continue;
 			const text = await this.disk.read(p);
 			if (text === null) continue;
-			await this.remote.createFile(p, text); // the index observer attaches it
+			await this.createNote(p, text); // the index observer attaches it
 		}
 
 		// notes we knew that are gone from the index and from disk
@@ -191,7 +227,7 @@ export class VaultSync {
 		} else if (!this.remote.readOnly) {
 			// deleted on the server but edited here: keep the file, it becomes a new note
 			this.hooks.notify({ kind: "restored", message: `"${path}" was deleted elsewhere but you changed it here; kept.` });
-			await this.remote.createFile(path, disk);
+			await this.createNote(path, disk);
 		}
 		this.saveSoon();
 	}
@@ -210,16 +246,33 @@ export class VaultSync {
 		n.moved(to);
 	}
 
+	/**
+	 * Keep text that could not merge as a note of its own: `<note> (conflict <device> <date time>).md`, named
+	 * from the note itself (never from another copy), skipped when an identical copy already exists, and
+	 * checked against this disk and the live index so the server never has to rename it.
+	 */
 	private async keepLocalCopy(path: string, text: string) {
 		if (this.remote.readOnly) return;
-		const stem = path.replace(/\.md$/, "");
+		const stem = baseStem(path);
 		const taken = new Set(await this.disk.list());
-		let name = `${stem} (local copy).md`;
-		for (let i = 2; taken.has(name); i++) name = `${stem} (local copy ${i}).md`;
-		this.quiet.add(name);
+		for (const p of this.byPath.keys()) taken.add(p);
+		this.remote.index.forEach((e) => {
+			if (!e.deleted) taken.add(e.path);
+		});
+		for (const p of taken) {
+			if (p.startsWith(`${stem} (conflict `) && (await this.disk.read(p)) === text) {
+				this.hooks.notify({ kind: "local-copy", message: `"${path}" changed here and elsewhere at once. The shared text is kept; your version is already saved as "${p}".` });
+				return;
+			}
+		}
+		const d = (this.opts.now ?? (() => new Date()))();
+		const when = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}${pad(d.getMinutes())}`;
+		const base = `${stem} (conflict ${this.opts.device ?? "device"} ${when}`;
+		let name = `${base}).md`;
+		for (let i = 2; taken.has(name); i++) name = `${base} ${i}).md`;
+		this.echoes.set(name, text);
 		await this.disk.write(name, text);
-		this.quiet.delete(name);
-		await this.remote.createFile(name, text);
+		await this.createNote(name, text);
 		this.hooks.notify({ kind: "local-copy", message: `"${path}" changed here and elsewhere at once. The shared text is kept; your version is saved as "${name}".` });
 	}
 
@@ -239,9 +292,11 @@ export class VaultSync {
 			const id = this.byPath.get(path);
 			const disk = await this.disk.read(path);
 			if (!id) {
-				if (disk !== null && !this.remote.readOnly) await this.remote.createFile(path, disk);
+				if (disk !== null && disk === this.echoes.get(path)) return; // our own write
+				if (disk !== null && !this.remote.readOnly) await this.createNote(path, disk);
 				return;
 			}
+			this.echoes.delete(path);
 			await this.notes.get(id)!.onDisk(disk);
 		});
 	}

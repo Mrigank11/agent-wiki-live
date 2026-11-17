@@ -1,4 +1,4 @@
-import { Component, Notice, Plugin, requestUrl, TFile } from "obsidian";
+import { Component, Notice, Platform, Plugin, requestUrl, TFile } from "obsidian";
 import { LiveSession, SessionHolder } from "./engine/LiveSession.ts";
 import { NonEmptyFolderError, VaultSync } from "./engine/VaultSync.ts";
 import { vaultState } from "./engine/vaultState.ts";
@@ -212,7 +212,7 @@ export default class AgentWikiLive extends Plugin {
 				onStatus: (s) => this.render(s === "connected" ? (info.read_only ? "connected (read only)" : "connected") : s),
 			});
 			await remote.synced();
-			const vs = new VaultSync(new VaultDisk(this.app), remote, this.stateStore, { notify: (n) => new Notice(n.message, 12000), log: (m, d) => console.debug("[agent-wiki-live]", m, d) }, { isOpen: (p) => this.binder.openPaths().has(p) });
+			const vs = new VaultSync(new VaultDisk(this.app), remote, this.stateStore, { notify: (n) => new Notice(n.message, 12000), log: (m, d) => console.debug("[agent-wiki-live]", m, d) }, { isOpen: (p) => this.binder.openPaths().has(p), device: Platform.isMobile ? "phone" : "desktop" });
 			await vs.start();
 			const session = new LiveSession(remote, vs);
 			this.watch(session);
