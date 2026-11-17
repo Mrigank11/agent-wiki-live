@@ -44,6 +44,9 @@ export class VaultSync {
 	private stopped = false;
 	private settleMs: number;
 	private readonly onIndex: (e: Y.YMapEvent<IndexEntry>, tr: Y.Transaction) => void;
+	private unlistenResync: (() => void) | null = null;
+	/** Notes this device renamed whose rename the server has not accepted yet (offline): the index's old path is not a remote move. */
+	private unsentMoves = new Set<string>();
 	/** Paths we are creating or moving ourselves, so the file event they raise is not taken as a person's edit. */
 	private quiet = new Set<string>();
 	/** What we wrote to files that were not yet notes (local copies): a file event for exactly this text is our own echo, whenever it arrives. */
@@ -99,12 +102,15 @@ export class VaultSync {
 			await this.syncIndex(true);
 		});
 		this.remote.index.observe(this.onIndex as any);
+		// back online after a break: what was deleted, renamed or created here meanwhile has not reached the server yet
+		this.unlistenResync = this.remote.onResync?.(() => void this.onEvent(() => this.syncIndex())) ?? null;
 		// notes created during the first pass (files the server did not know) were not observed yet: attach them
 		await this.enqueue(() => this.syncIndex());
 	}
 
 	stop() {
 		this.stopped = true;
+		this.unlistenResync?.();
 		this.remote.index.unobserve(this.onIndex as any);
 		this.saveNow(); // before the notes go: what we remember is what they know
 		for (const n of this.notes.values()) n.destroy();
@@ -124,6 +130,11 @@ export class VaultSync {
 		const entries = this.entries();
 		const localPaths = new Set(await this.disk.list());
 		const claimed = new Set<string>();
+		// files on disk that no note, in the index or remembered, accounts for: where a note renamed while we were away may now be
+		const unknown = new Set(localPaths);
+		for (const e of entries.values()) if (!e.deleted) unknown.delete(e.path);
+		for (const r of Object.values(this.records)) unknown.delete(r.path);
+		for (const n of this.notes.values()) unknown.delete(n.path);
 
 		for (const [id, e] of entries) {
 			if (e.deleted) {
@@ -133,10 +144,18 @@ export class VaultSync {
 			claimed.add(e.path);
 			const known = this.notes.get(id);
 			if (known) {
-				if (known.path !== e.path) await this.remoteMoved(id, known, e.path);
+				if (this.unsentMoves.has(id)) {
+					// renamed here while the server could not be told: tell it now instead of undoing the rename
+					if (e.path !== known.path) await this.sendMove(id, e.path, known.path);
+					if (this.unsentMoves.has(id)) continue;
+				} else if (known.path !== e.path) {
+					await this.remoteMoved(id, known, e.path);
+					continue;
+				}
+				if (!localPaths.has(known.path) && !this.quiet.has(known.path)) await this.deletedHere(id, known);
 				continue;
 			}
-			await this.attach(id, e.path, localPaths);
+			await this.attach(id, e.path, localPaths, claimed, unknown);
 		}
 
 		// files on disk the server does not know
@@ -169,7 +188,37 @@ export class VaultSync {
 		this.saveSoon();
 	}
 
-	private async attach(id: string, path: string, localPaths: Set<string>) {
+	/** The one file in `unknown` whose text is exactly `base`: a note renamed while Obsidian was closed (a rename is not told, only found). */
+	private async renamedTo(base: string, unknown: Set<string>) {
+		if (!base.trim()) return null;
+		let found: string | null = null;
+		for (const p of unknown) {
+			if ((await this.disk.read(p)) !== base) continue;
+			if (found) return null; // two candidates: cannot tell which
+			found = p;
+		}
+		return found;
+	}
+
+	private async attach(id: string, path: string, localPaths: Set<string>, claimed: Set<string>, unknown: Set<string>) {
+		const rec0 = this.records[id];
+		if (rec0 && rec0.path === path && !localPaths.has(path) && !this.remote.readOnly) {
+			// gone from where we left it, and a file with exactly its text turned up elsewhere: it was renamed
+			const to = await this.renamedTo(rec0.base, unknown);
+			const alike = Object.entries(this.records).filter(([k, r]) => k !== id && r.base === rec0.base && !localPaths.has(r.path));
+			if (to && alike.length === 0) {
+				unknown.delete(to);
+				claimed.add(to);
+				try {
+					await this.remote.moveFile(path, to);
+				} catch (e) {
+					this.hooks.log?.("rename while closed: server refused, will retry", String(e));
+					return;
+				}
+				this.records[id] = { path: to, base: rec0.base };
+				path = to;
+			}
+		}
 		const live = this.remote.openNote(id);
 		await live.synced;
 		const rec = this.records[id];
@@ -205,6 +254,30 @@ export class VaultSync {
 			} else this.hooks.notify({ kind: "restored", message: `"${path}" was deleted here but changed elsewhere; restored.` });
 		}
 		await n.reconcile(path);
+	}
+
+	/** A note's file is gone from disk while the server still lists it: a delete the server was never told. A deletion never beats text that changed elsewhere. */
+	private async deletedHere(id: string, n: NoteSync) {
+		if (this.remote.readOnly || n.text !== n.base) {
+			await n.onDisk(null); // brings the file back
+			return;
+		}
+		try {
+			await this.remote.deleteFile(n.path);
+		} catch (e) {
+			this.hooks.log?.("delete: server not reachable, will retry", String(e));
+		}
+	}
+
+	/** Tell the server a rename made here; if it cannot be reached it stays remembered and is retried when the index next syncs. */
+	private async sendMove(id: string, from: string, to: string) {
+		try {
+			await this.remote.moveFile(from, to);
+			this.unsentMoves.delete(id);
+		} catch (e) {
+			this.unsentMoves.add(id);
+			this.hooks.log?.("rename: server not reachable, will retry", String(e));
+		}
 	}
 
 	private async remoteDeleted(id: string) {
@@ -316,7 +389,11 @@ export class VaultSync {
 				await n.onDisk(null);
 				return;
 			}
-			await this.remote.deleteFile(path);
+			try {
+				await this.remote.deleteFile(path);
+			} catch (e) {
+				this.hooks.log?.("delete: server not reachable, will retry", String(e)); // the file is still gone here; the next index sync tells the server
+			}
 		});
 	}
 
@@ -328,7 +405,7 @@ export class VaultSync {
 			this.byPath.delete(from);
 			this.byPath.set(to, id);
 			this.notes.get(id)!.moved(to);
-			await this.remote.moveFile(from, to);
+			await this.sendMove(id, from, to);
 		});
 	}
 

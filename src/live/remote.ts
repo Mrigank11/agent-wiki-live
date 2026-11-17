@@ -48,6 +48,8 @@ export class HocuspocusRemote implements RemotePort {
 	private o: RemoteOptions;
 	private open = new Map<string, HocuspocusProvider>();
 	private syncedOf = new WeakMap<HocuspocusProvider, Promise<void>>();
+	private resyncs = new Set<() => void>();
+	private firstSync = true;
 
 	constructor(o: RemoteOptions) {
 		this.o = o;
@@ -60,6 +62,15 @@ export class HocuspocusRemote implements RemotePort {
 		const doc = new Y.Doc();
 		this.index = doc.getMap("files");
 		this.indexProvider = this.provider(`${o.vault}/__index`, doc, true);
+		this.indexProvider.on("synced", () => {
+			if (this.firstSync) return void (this.firstSync = false);
+			for (const cb of [...this.resyncs]) cb();
+		});
+	}
+
+	onResync(cb: () => void) {
+		this.resyncs.add(cb);
+		return () => void this.resyncs.delete(cb);
 	}
 
 	private provider(name: string, doc: Y.Doc, isIndex = false) {

@@ -38,6 +38,8 @@ export interface RemotePort {
 	deleteFile(path: string): Promise<void>;
 	/** True when this person may not edit (read-only trust). */
 	readOnly: boolean;
+	/** Called every time the connection is back and the index has caught up (not the first time). Returns a way to stop listening. */
+	onResync?(cb: () => void): () => void;
 }
 
 /** What the plugin remembers between runs, per note: where it is and the last text known equal on disk and live. */
