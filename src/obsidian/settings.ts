@@ -1,5 +1,6 @@
 import { Notice, PluginSettingTab, Setting, type App } from "obsidian";
 import type { ProviderInfo, VaultInfo } from "../live/gateway.ts";
+import { describe } from "../live/signin.ts";
 import type AgentWikiLive from "../main.ts";
 
 export class LiveSettingTab extends PluginSettingTab {
@@ -26,23 +27,53 @@ export class LiveSettingTab extends PluginSettingTab {
 				try {
 					this.providers = (await p.gateway().providers()).providers;
 					new Notice("Server found.");
+					this.checked = false;
 					this.display();
 				} catch (e) {
 					new Notice(`Could not reach the server: ${(e as Error).message}`);
 				}
 			}));
 
-		if (!p.user) {
-			new Setting(el).setName("Token").setDesc("The token an admin gave you. Kept on this device in the plugin's data file, in plain text.").addText((t) => { t.inputEl.type = "password"; t.onChange((v) => (this.tokenText = v)); })
-				.addButton((b) => b.setButtonText("Sign in").setCta().onClick(() => p.signInToken(this.tokenText).then(() => this.display())));
-			for (const prov of this.providers ?? []) {
-				new Setting(el).setName(`Sign in with ${prov.name}`).addButton((b) => b.setButtonText(prov.name).onClick(() => p.signInProvider(prov).then(() => this.display())));
-			}
-			if (!this.providers) el.createEl("p", { text: "Press Check to see which sign-in methods the server offers.", cls: "setting-item-description" });
-		} else {
-			new Setting(el).setName(`Signed in as ${p.user}`).addButton((b) => b.setButtonText("Sign out").onClick(async () => { await p.signOut(); this.display(); }));
-			void this.vaultPicker(el);
+		const st = p.signin;
+		// Ask the server, not the saved name; show the answer when it differs from what is drawn.
+		if (!this.checked) {
+			this.checked = true;
+			void p.refreshSignIn().then((now) => now.kind !== st.kind && this.display());
 		}
+		if (!this.providers && d.url && !this.fetching) {
+			this.fetching = true;
+			void p.gateway().providers().then((r) => { this.providers = r.providers; this.display(); }).catch(() => {});
+		}
+		const c = describe(st);
+		if (st.kind === "not_set_up") {
+			this.signInForm(el);
+		} else {
+			const row = new Setting(el).setName(c.title).setDesc(c.detail);
+			if (c.warn) row.settingEl.addClass("mod-warning");
+			if (st.kind === "ended") {
+				row.addButton((b) => b.setButtonText(c.action!).setCta().onClick(async () => { await p.signInAgain(); this.display(); }));
+				new Setting(el).setName("Use a different account").setDesc("Forget this sign-in and start over.").addButton((b) => b.setButtonText("Sign out").onClick(async () => { await p.signOut(); this.display(); }));
+			} else if (st.kind === "unreachable") {
+				row.addButton((b) => b.setButtonText(c.action!).onClick(async () => { await p.refreshSignIn(); this.display(); }));
+			} else {
+				row.addButton((b) => b.setButtonText("Sign out").onClick(async () => { await p.signOut(); this.display(); }));
+			}
+			if (st.kind === "signed_in") void this.vaultPicker(el);
+		}
+	}
+
+	private checked = false;
+	private fetching = false;
+
+	/** Every way the server offers, shown at once: no Check press needed. */
+	private signInForm(el: HTMLElement) {
+		const p = this.plugin;
+		for (const prov of this.providers ?? []) {
+			new Setting(el).setName(`Sign in with ${prov.name}`).addButton((b) => b.setButtonText(prov.name).onClick(() => p.signInProvider(prov).then(() => this.display())));
+		}
+		new Setting(el).setName("Token").setDesc("The token an admin gave you. Kept on this device in the plugin's data file, in plain text.").addText((t) => { t.inputEl.type = "password"; t.onChange((v) => (this.tokenText = v)); })
+			.addButton((b) => b.setButtonText("Sign in").setCta().onClick(() => p.signInToken(this.tokenText).then(() => this.display())));
+		if (!this.providers && p.data.url) el.createEl("p", { text: "Looking for the sign-in methods the server offers…", cls: "setting-item-description" });
 	}
 
 	private async vaultPicker(el: HTMLElement) {

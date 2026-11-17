@@ -38,6 +38,8 @@ export class Gateway {
 	readonly base: string;
 	private http: Http;
 	private cookies = new Map<string, string>();
+	/** Names this device to the server, so its sign-in never idles out and shows in the admin's device list. */
+	device = "";
 	/** Called when the session is gone (401): the caller signs in again or asks the person to. */
 	onSignedOut: () => void = () => {};
 
@@ -85,15 +87,19 @@ export class Gateway {
 		return data as T;
 	}
 
+	private deviceBody() {
+		return this.device ? { device: this.device } : {};
+	}
+
 	providers() {
 		return this.call<Providers>("GET", "/providers", undefined, true);
 	}
 	loginToken(token: string) {
-		return this.call<Who>("POST", "/session", { token: token.trim() }, true);
+		return this.call<Who>("POST", "/session", { token: token.trim(), ...this.deviceBody() }, true);
 	}
 	/** A provider that proves who you are by the request itself (Tailscale). */
 	loginDirect(id: string) {
-		return this.call<Who>("POST", `/session/${encodeURIComponent(id)}`, {}, true);
+		return this.call<Who>("POST", `/session/${encodeURIComponent(id)}`, this.deviceBody(), true);
 	}
 	/** The address to open in the browser for a redirect provider; the browser ends at obsidian://agent-wiki-live-signin?code=... */
 	async beginRedirect(p: ProviderInfo) {
@@ -102,7 +108,7 @@ export class Gateway {
 		return { url: this.base + start + (start.includes("?") ? "&" : "?") + "handback_challenge=" + h.challenge, verifier: h.verifier };
 	}
 	finishHandback(code: string, verifier: string) {
-		return this.call<Who>("POST", "/session/handback", { code, verifier }, true);
+		return this.call<Who>("POST", "/session/handback", { code, verifier, ...this.deviceBody() }, true);
 	}
 	whoami() {
 		return this.call<Who>("GET", "/session", undefined, true);

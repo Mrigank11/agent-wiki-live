@@ -1,2 +1,5 @@
 /* y-codemirror.next draws remote cursors with its own classes; nothing else to style yet. */
 .cm-ySelectionInfo { font-family: var(--font-interface); }
+
+/* a sign-in that ended: the row is a warning, with its one action beside it */
+.setting-item.mod-warning { border-left: 3px solid var(--text-warning); padding-left: 12px; }
