@@ -60,7 +60,12 @@ export class LiveSettingTab extends PluginSettingTab {
 		s.addDropdown((dd) => {
 			dd.addOption("", "Choose…");
 			for (const v of this.vaults!) dd.addOption(v.name, v.read_only ? `${v.name} (read only)` : v.name);
-			dd.setValue(d.vault).onChange(async (v) => { d.vault = v; await p.saveData(d); });
+			dd.setValue(d.vault).onChange(async (v) => {
+				if (v !== d.vault && p.connected) await p.disconnect(); // the open connection is to the old vault
+				d.vault = v;
+				await p.saveData(d);
+				this.display();
+			});
 		});
 		new Setting(el).setName(p.connected ? "Connected" : "Not connected").setDesc(p.statusText)
 			.addButton((b) => b.setButtonText(p.connected ? "Disconnect" : "Connect").setCta().onClick(async () => { if (p.connected) await p.disconnect(); else await p.connect(); this.display(); }));

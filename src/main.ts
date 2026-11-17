@@ -1,5 +1,7 @@
-import { Notice, Plugin, requestUrl, TFile } from "obsidian";
+import { Component, Notice, Plugin, requestUrl, TFile } from "obsidian";
+import { LiveSession, SessionHolder } from "./engine/LiveSession.ts";
 import { NonEmptyFolderError, VaultSync } from "./engine/VaultSync.ts";
+import { vaultState } from "./engine/vaultState.ts";
 import type { NoteRecord, StatePort } from "./engine/types.ts";
 import { Gateway, GatewayError, type Http, type ProviderInfo } from "./live/gateway.ts";
 import { HocuspocusRemote } from "./live/remote.ts";
@@ -7,8 +9,8 @@ import { EditorBinder } from "./obsidian/editor.ts";
 import { LiveSettingTab } from "./obsidian/settings.ts";
 import { VaultDisk } from "./obsidian/vaultDisk.ts";
 
-type Data = { url: string; token: string; session: string; user: string; vault: string; connected: boolean; notes: Record<string, NoteRecord> };
-const EMPTY: Data = { url: "", token: "", session: "", user: "", vault: "", connected: false, notes: {} };
+type Data = { url: string; token: string; session: string; user: string; vault: string; connected: boolean; notesVault: string; notes: Record<string, NoteRecord> };
+const EMPTY: Data = { url: "", token: "", session: "", user: "", vault: "", connected: false, notesVault: "", notes: {} };
 
 const http: Http = async (r) => {
 	const res = await requestUrl({ url: r.url, method: r.method, headers: r.headers, body: r.body, throw: false });
@@ -21,18 +23,16 @@ export default class AgentWikiLive extends Plugin {
 	connected = false;
 	statusText = "";
 	private gw: Gateway | null = null;
-	private vs: VaultSync | null = null;
-	private remote: HocuspocusRemote | null = null;
+	private holder = new SessionHolder();
 	private status!: HTMLElement;
 	private binder!: EditorBinder;
 	private pending: { verifier: string } | null = null;
-	private tick: number | null = null;
 
 	async onload() {
 		this.data = { ...EMPTY, ...(await this.loadData()) };
 		this.user = this.data.user;
 		this.status = this.addStatusBarItem();
-		this.binder = new EditorBinder(this.app, () => this.vs);
+		this.binder = new EditorBinder(this.app, () => this.holder.current?.vs ?? null);
 		this.registerEditorExtension(this.binder.extension);
 		this.addSettingTab(new LiveSettingTab(this.app, this));
 		this.registerObsidianProtocolHandler("agent-wiki-live-signin", (params) => void this.finishRedirect(params.code));
@@ -127,22 +127,44 @@ export default class AgentWikiLive extends Plugin {
 	// ------------------------------------------------------------------ the live vault
 
 	get stateStore(): StatePort {
-		return { load: () => this.data.notes, save: (n) => { this.data.notes = n; void this.saveData(this.data); } };
+		return vaultState(this.data, () => void this.saveData(this.data));
 	}
 
+	/** Open the live connection; a Reconnect while one is opening joins it, and a new one replaces the old. */
 	async connect() {
-		if (this.vs) await this.disconnect(false);
-		if (!this.data.url || !this.data.vault) return void new Notice("Choose a server and a vault in the plugin settings first.");
+		try {
+			await this.holder.connect(() => this.openSession());
+		} catch (e) {
+			if (!(e instanceof Handled)) throw e;
+		}
+	}
+
+	private async openSession(): Promise<LiveSession> {
+		const fail = (msg: string, ms = 15000): never => {
+			this.connected = false;
+			this.render("not connected");
+			new Notice(`agent-wiki: ${msg}`, ms);
+			throw new Handled();
+		};
+		this.connected = false;
+		if (!this.data.url || !this.data.vault) {
+			new Notice("Choose a server and a vault in the plugin settings first.");
+			throw new Handled();
+		}
 		const g = this.gateway();
+		let remote: HocuspocusRemote | null = null;
 		try {
 			if (!(await g.whoami().catch(() => null))) {
-				if (!this.data.token) return this.render("signed out: sign in again in settings");
+				if (!this.data.token) {
+					this.render("signed out: sign in again in settings");
+					throw new Handled();
+				}
 				await this.signedIn(await g.loginToken(this.data.token));
 			}
 			const info = (await g.vaults()).find((v) => v.name === this.data.vault);
 			if (!info) throw new Error(`You cannot open "${this.data.vault}" (it may not be live, or you have no access).`);
 			this.render("connecting…");
-			const remote = new HocuspocusRemote({
+			remote = new HocuspocusRemote({
 				url: g.wsUrl,
 				vault: info.name,
 				user: this.user,
@@ -152,51 +174,46 @@ export default class AgentWikiLive extends Plugin {
 				onRefused: (reason) => { this.render(`stopped: ${reason}`); new Notice(`agent-wiki: ${reason}`); },
 				onStatus: (s) => this.render(s === "connected" ? (info.read_only ? "connected (read only)" : "connected") : s),
 			});
-			this.remote = remote;
 			await remote.synced();
 			const vs = new VaultSync(new VaultDisk(this.app), remote, this.stateStore, { notify: (n) => new Notice(n.message, 12000), log: (m, d) => console.debug("[agent-wiki-live]", m, d) }, { isOpen: (p) => this.binder.openPaths().has(p) });
-			this.vs = vs;
 			await vs.start();
+			const session = new LiveSession(remote, vs);
+			this.watch(session);
 			this.connected = true;
 			this.data.connected = true;
 			await this.saveData(this.data);
-			this.watch(vs);
 			this.render(`${info.read_only ? "connected (read only)" : "connected"} · ${vs.size} notes`);
+			return session;
 		} catch (e) {
-			this.remote?.destroy();
-			this.remote = null;
-			this.vs = null;
-			this.connected = false;
-			const msg = e instanceof NonEmptyFolderError ? e.message : (e as Error).message;
-			this.render("not connected");
-			new Notice(`agent-wiki: ${msg}`, 15000);
+			remote?.destroy();
+			if (e instanceof Handled) throw e;
+			return fail(e instanceof NonEmptyFolderError ? e.message : (e as Error).message);
 		}
 	}
 
-	private watch(vs: VaultSync) {
+	/** Everything the session listens to or runs is owned by it, so it all ends with it. */
+	private watch(session: LiveSession) {
+		const host = new Component();
+		this.addChild(host);
+		session.own(() => this.removeChild(host));
 		const md = (f: unknown): f is TFile => f instanceof TFile && f.extension === "md";
-		this.registerEvent(this.app.vault.on("modify", (f) => md(f) && void vs.fileChanged(f.path)));
-		this.registerEvent(this.app.vault.on("create", (f) => md(f) && void vs.fileCreated(f.path)));
-		this.registerEvent(this.app.vault.on("delete", (f) => md(f) && void vs.fileDeleted(f.path)));
-		this.registerEvent(this.app.vault.on("rename", (f, old) => md(f) && void vs.fileRenamed(old, f.path)));
+		const vs = session.vs;
+		host.registerEvent(this.app.vault.on("modify", (f) => md(f) && void vs.fileChanged(f.path)));
+		host.registerEvent(this.app.vault.on("create", (f) => md(f) && void vs.fileCreated(f.path)));
+		host.registerEvent(this.app.vault.on("delete", (f) => md(f) && void vs.fileDeleted(f.path)));
+		host.registerEvent(this.app.vault.on("rename", (f, old) => md(f) && void vs.fileRenamed(old, f.path)));
 		const bind = () => void this.binder.refresh();
-		this.registerEvent(this.app.workspace.on("active-leaf-change", bind));
-		this.registerEvent(this.app.workspace.on("file-open", bind));
-		this.registerEvent(this.app.workspace.on("layout-change", bind));
+		host.registerEvent(this.app.workspace.on("active-leaf-change", bind));
+		host.registerEvent(this.app.workspace.on("file-open", bind));
+		host.registerEvent(this.app.workspace.on("layout-change", bind));
 		// notes attach in the background; bind editors as they appear
-		this.tick = window.setInterval(bind, 2000);
-		this.registerInterval(this.tick);
+		host.registerInterval(window.setInterval(bind, 2000));
+		session.own(() => this.binder.unbindAll());
 		bind();
 	}
 
 	async disconnect(persist = true) {
-		if (this.tick) window.clearInterval(this.tick);
-		this.tick = null;
-		this.binder?.unbindAll();
-		this.vs?.stop();
-		this.vs = null;
-		this.remote?.destroy();
-		this.remote = null;
+		await this.holder.disconnect();
 		this.connected = false;
 		if (persist) {
 			this.data.connected = false;
@@ -205,3 +222,6 @@ export default class AgentWikiLive extends Plugin {
 		this.render("not connected");
 	}
 }
+
+/** A failure already reported to the person (a notice or the status bar). */
+class Handled extends Error {}

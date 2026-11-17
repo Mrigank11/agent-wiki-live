@@ -225,9 +225,16 @@ export class VaultSync {
 
 	// ---------------------------------------------------------------- what Obsidian tells us
 
+	/** Queue a reaction to a vault event. A stopped engine reacts to nothing: it no longer owns the connection. */
+	private onEvent(fn: () => Promise<void>) {
+		return this.enqueue(async () => {
+			if (!this.stopped) await fn();
+		});
+	}
+
 	/** A file was written (a save, an outside edit, a sync tool). */
 	fileChanged(path: string) {
-		return this.enqueue(async () => {
+		return this.onEvent(async () => {
 			if (this.quiet.has(path)) return;
 			const id = this.byPath.get(path);
 			const disk = await this.disk.read(path);
@@ -244,7 +251,7 @@ export class VaultSync {
 	}
 
 	fileDeleted(path: string) {
-		return this.enqueue(async () => {
+		return this.onEvent(async () => {
 			if (this.quiet.has(path)) return;
 			const id = this.byPath.get(path);
 			if (!id) return;
@@ -259,7 +266,7 @@ export class VaultSync {
 	}
 
 	fileRenamed(from: string, to: string) {
-		return this.enqueue(async () => {
+		return this.onEvent(async () => {
 			if (this.quiet.has(to)) return;
 			const id = this.byPath.get(from);
 			if (!id || this.remote.readOnly) return;
@@ -272,7 +279,7 @@ export class VaultSync {
 
 	/** Make sure a note's pending outside edit is merged (used right before the editor binds to it). */
 	ready(path: string) {
-		return this.enqueue(async () => {
+		return this.onEvent(async () => {
 			const id = this.byPath.get(path);
 			if (id) await this.notes.get(id)!.reconcile(path);
 		});
