@@ -3,3 +3,6 @@
 
 /* a sign-in that ended: the row is a warning, with its one action beside it */
 .setting-item.mod-warning { border-left: 3px solid var(--text-warning); padding-left: 12px; }
+
+/* connecting: "212 of 592 notes" as a bar under the connection row's words */
+.agent-wiki-progress { width: 100%; margin-top: 8px; }

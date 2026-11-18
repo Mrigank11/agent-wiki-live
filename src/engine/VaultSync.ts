@@ -1,6 +1,6 @@
 import type * as Y from "yjs";
 import { NoteSync } from "./NoteSync.ts";
-import type { DiskPort, Hooks, IndexEntry, NoteRecord, RemotePort, StatePort } from "./types.ts";
+import type { DiskPort, Hooks, IndexEntry, LiveNote, NoteRecord, RemotePort, StatePort } from "./types.ts";
 
 export type VaultSyncOptions = {
 	settleMs?: number;
@@ -21,6 +21,9 @@ export type VaultSyncOptions = {
 const SUFFIXES = /(?: \((?:conflict [^)]*|local copy(?: \d+)?|\d+)\))+$/;
 export const baseStem = (path: string) => path.replace(/\.md$/, "").replace(SUFFIXES, "");
 const pad = (n: number) => String(n).padStart(2, "0");
+
+/** How many notes are opened (their sync asked of the server) at once while attaching a vault. */
+export const ATTACH_WINDOW = 64;
 
 export class NonEmptyFolderError extends Error {
 	constructor() {
@@ -45,6 +48,10 @@ export class VaultSync {
 	private settleMs: number;
 	private readonly onIndex: (e: Y.YMapEvent<IndexEntry>, tr: Y.Transaction) => void;
 	private unlistenResync: (() => void) | null = null;
+	/** The first full attach: the first index pass and the one after it. */
+	private firstPass: Promise<void> = Promise.resolve();
+	/** Notes asked of the server whose answer has not been taken yet; stopping closes them. */
+	private opening = new Set<LiveNote>();
 	/** Notes this device renamed whose rename the server has not accepted yet (offline): the index's old path is not a remote move. */
 	private unsentMoves = new Set<string>();
 	/** Paths we are creating or moving ourselves, so the file event they raise is not taken as a person's edit. */
@@ -96,16 +103,30 @@ export class VaultSync {
 		return this.queue;
 	}
 
+	/**
+	 * Checks the folder and queues the first pass over the vault. Resolves as soon as that is queued: the vault is
+	 * usable at once, and its notes attach in the background (`attached()` says when they all have, `Hooks.progress` how far).
+	 */
 	async start() {
-		if (!this.opts.adoptExisting && Object.keys(this.records).length === 0 && (await this.disk.list()).length > 0) throw new NonEmptyFolderError();
-		await this.enqueue(async () => {
-			await this.syncIndex(true);
-		});
+		// a folder is "ours" once we remember notes in it, or were here before and remember none (stopped while filling an empty folder)
+		const resumed = Object.keys(this.records).length > 0 || this.state.started?.() === true;
+		if (!this.opts.adoptExisting && !resumed && (await this.disk.list()).length > 0) throw new NonEmptyFolderError();
+		if (!resumed && this.state.flush) {
+			// mark the folder as ours before the first note is written to it: a kill in the middle of the first fill must not turn the next start into "this folder already has notes"
+			this.state.save({});
+			await this.state.flush().catch((e) => this.hooks.log?.("could not mark the folder", String(e)));
+		}
+		const first = this.enqueue(() => this.syncIndex(true));
 		this.remote.index.observe(this.onIndex as any);
 		// back online after a break: what was deleted, renamed or created here meanwhile has not reached the server yet
 		this.unlistenResync = this.remote.onResync?.(() => void this.onEvent(() => this.syncIndex())) ?? null;
 		// notes created during the first pass (files the server did not know) were not observed yet: attach them
-		await this.enqueue(() => this.syncIndex());
+		this.firstPass = first.then(() => this.enqueue(() => this.syncIndex()));
+	}
+
+	/** Resolves when the first full attach is done: every note the server had is open and settled. */
+	attached(): Promise<void> {
+		return this.firstPass;
 	}
 
 	stop() {
@@ -113,6 +134,8 @@ export class VaultSync {
 		this.unlistenResync?.();
 		this.remote.index.unobserve(this.onIndex as any);
 		this.saveNow(); // before the notes go: what we remember is what they know
+		for (const l of this.opening) l.destroy();
+		this.opening.clear();
 		for (const n of this.notes.values()) n.destroy();
 		this.notes.clear();
 	}
@@ -127,6 +150,7 @@ export class VaultSync {
 
 	/** Index and disk, side by side: attach what the server has, create what only we have, follow renames and deletes. */
 	private async syncIndex(first = false) {
+		if (this.stopped) return;
 		const entries = this.entries();
 		const localPaths = new Set(await this.disk.list());
 		const claimed = new Set<string>();
@@ -136,6 +160,7 @@ export class VaultSync {
 		for (const r of Object.values(this.records)) unknown.delete(r.path);
 		for (const n of this.notes.values()) unknown.delete(n.path);
 
+		const toAttach: { id: string; path: string }[] = [];
 		for (const [id, e] of entries) {
 			if (e.deleted) {
 				await this.remoteDeleted(id);
@@ -155,8 +180,11 @@ export class VaultSync {
 				if (!localPaths.has(known.path) && !this.quiet.has(known.path)) await this.deletedHere(id, known);
 				continue;
 			}
-			await this.attach(id, e.path, localPaths, claimed, unknown);
+			const at = await this.prepareAttach(id, e.path, localPaths, claimed, unknown);
+			if (at !== null) toAttach.push({ id, path: at });
 		}
+		await this.attachAll(toAttach, localPaths);
+		if (this.stopped) return;
 
 		// files on disk the server does not know
 		for (const p of localPaths) {
@@ -200,7 +228,11 @@ export class VaultSync {
 		return found;
 	}
 
-	private async attach(id: string, path: string, localPaths: Set<string>, claimed: Set<string>, unknown: Set<string>) {
+	/**
+	 * Before a note is opened: a note renamed while Obsidian was closed is found and the server told. Returns the path
+	 * the note is at now, or null when it cannot be attached yet (the server refused the rename; it is retried).
+	 */
+	private async prepareAttach(id: string, path: string, localPaths: Set<string>, claimed: Set<string>, unknown: Set<string>): Promise<string | null> {
 		const rec0 = this.records[id];
 		if (rec0 && rec0.path === path && !localPaths.has(path) && !this.remote.readOnly) {
 			// gone from where we left it, and a file with exactly its text turned up elsewhere: it was renamed
@@ -213,14 +245,69 @@ export class VaultSync {
 					await this.remote.moveFile(path, to);
 				} catch (e) {
 					this.hooks.log?.("rename while closed: server refused, will retry", String(e));
-					return;
+					return null;
 				}
 				this.records[id] = { path: to, base: rec0.base };
 				path = to;
 			}
 		}
-		const live = this.remote.openNote(id);
-		await live.synced;
+		return path;
+	}
+
+	/**
+	 * Opens the notes `ATTACH_WINDOW` at a time: each window's sync is asked of the server at once (a round trip per
+	 * window, not per note), then its notes are settled one by one. The next window is asked for as soon as this one
+	 * has answered, so its round trip overlaps with settling this one's notes (never more than one window is unanswered).
+	 * File events wait in the queue behind this, so an edit to a note that is not attached yet is merged when it is.
+	 */
+	private async attachAll(items: { id: string; path: string }[], localPaths: Set<string>) {
+		try {
+			await this.attachWindows(items, localPaths);
+		} catch (e) {
+			// the attach is over: let go of the windows asked for, and say so, so that no screen keeps counting up to a total it will not reach
+			for (const live of this.opening) live.destroy();
+			this.opening.clear();
+			const why = (e as Error)?.message ?? String(e);
+			this.hooks.attachFailed?.(why);
+			this.hooks.notify({ kind: "error", message: `agent-wiki could not open all your notes (${why}). The vault is live; Reconnect to try the rest again.` });
+			throw e;
+		}
+	}
+
+	private async attachWindows(items: { id: string; path: string }[], localPaths: Set<string>) {
+		const total = items.length;
+		if (!total || this.stopped) return;
+		this.hooks.progress?.(0, total);
+		const ask = (from: number) => {
+			const win = items.slice(from, from + ATTACH_WINDOW);
+			const lives = win.map((a) => {
+				const live = this.remote.openNote(a.id);
+				this.opening.add(live);
+				return live;
+			});
+			return { win, lives, answered: Promise.all(lives.map((l) => l.synced)) };
+		};
+		let done = 0;
+		let cur = ask(0);
+		for (let i = 0; i < total; i += ATTACH_WINDOW) {
+			await cur.answered;
+			const now = cur;
+			cur = i + ATTACH_WINDOW < total && !this.stopped ? ask(i + ATTACH_WINDOW) : now;
+			for (let k = 0; k < now.win.length; k++) {
+				const wasOpen = this.opening.delete(now.lives[k]);
+				if (this.stopped) {
+					if (wasOpen) now.lives[k].destroy();
+					continue;
+				}
+				await this.finishAttach(now.win[k].id, now.win[k].path, now.lives[k], localPaths);
+				this.hooks.progress?.(++done, total);
+			}
+			if (this.stopped) return;
+		}
+	}
+
+	/** After a note's sync: decide what is where, and bring file and live text into agreement. */
+	private async finishAttach(id: string, path: string, live: LiveNote, localPaths: Set<string>) {
 		const rec = this.records[id];
 		const n = new NoteSync(id, rec, live, this.disk, this.hooks, (fn) => void this.enqueue(fn), (p, t) => this.keepLocalCopy(p, t), {
 			settleMs: this.settleMs,

@@ -47,12 +47,20 @@ export type NoteRecord = { path: string; base: string };
 export interface StatePort {
 	load(): Record<string, NoteRecord>;
 	save(notes: Record<string, NoteRecord>): void;
+	/** True when this device has been connected to this vault before, even if it remembers no notes (it was stopped while filling an empty folder). */
+	started?(): boolean;
+	/** Resolves when everything saved so far is durable. */
+	flush?(): Promise<void>;
 }
 
 export type Notice = { kind: "local-copy" | "restored" | "info" | "error"; message: string };
 export interface Hooks {
 	notify(n: Notice): void;
 	log?(msg: string, data?: unknown): void;
+	/** How many of the notes being opened are attached so far (`done` of `total`). Called as the engine works through them. */
+	progress?(done: number, total: number): void;
+	/** The background attach ended early (a note could not be opened). The vault stays usable; the rest of its notes are not attached yet. */
+	attachFailed?(reason: string): void;
 }
 
 export const ORIGIN_DISK = "agent-wiki-live:disk";

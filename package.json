@@ -1,6 +1,6 @@
 {
 	"name": "agent-wiki-live",
-	"version": "0.2.4",
+	"version": "0.3.0",
 	"private": true,
 	"description": "agent-wiki Live: Obsidian plugin for live co-editing with an agent-wiki vault.",
 	"main": "main.js",
@@ -9,7 +9,9 @@
 	"scripts": {
 		"test": "node --test --experimental-strip-types test/merge.test.ts",
 		"typecheck": "tsc -noEmit -skipLibCheck",
-		"build": "node esbuild.config.mjs"
+		"build": "node esbuild.config.mjs",
+		"bench": "node --experimental-strip-types scripts/bench-connect.ts",
+		"test:obsidian": "node --test --test-concurrency=1 --experimental-strip-types 'test/obsidian/*.e2e.ts'"
 	},
 	"devDependencies": {
 		"@types/node": "^24.0.0",

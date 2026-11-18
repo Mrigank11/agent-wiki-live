@@ -1,17 +1,14 @@
 import { Component, Notice, Platform, Plugin, requestUrl, TFile } from "obsidian";
 import { LiveSession, SessionHolder } from "./engine/LiveSession.ts";
-import { NonEmptyFolderError, VaultSync } from "./engine/VaultSync.ts";
-import { vaultState } from "./engine/vaultState.ts";
-import type { NoteRecord, StatePort } from "./engine/types.ts";
+import { VaultSync } from "./engine/VaultSync.ts";
 import { Gateway, GatewayError, type Http, type ProviderInfo } from "./live/gateway.ts";
-import { describe, probe, type SignInState } from "./live/signin.ts";
+import { Connector, Refusal, type OpenHooks } from "./state/connector.ts";
+import { describe as describeState, Store, type Action } from "./state/connection.ts";
 import { HocuspocusRemote } from "./live/remote.ts";
 import { EditorBinder } from "./obsidian/editor.ts";
 import { LiveSettingTab } from "./obsidian/settings.ts";
+import { EMPTY, migrateLegacy, NoteFile, type Data, type FileStore } from "./obsidian/noteFile.ts";
 import { VaultDisk } from "./obsidian/vaultDisk.ts";
-
-type Data = { url: string; token: string; session: string; user: string; via: string; vault: string; connected: boolean; notesVault: string; notes: Record<string, NoteRecord> };
-const EMPTY: Data = { url: "", token: "", session: "", user: "", via: "", vault: "", connected: false, notesVault: "", notes: {} };
 
 const http: Http = async (r) => {
 	const res = await requestUrl({ url: r.url, method: r.method, headers: r.headers, body: r.body, throw: false });
@@ -21,36 +18,93 @@ const http: Http = async (r) => {
 export default class AgentWikiLive extends Plugin {
 	data: Data = { ...EMPTY };
 	user = "";
-	connected = false;
-	statusText = "";
-	/** What the server last said about this device's sign-in (never inferred from the saved name). */
-	signin: SignInState = { kind: "not_set_up" };
+	/** The one answer to "am I signed in, am I connected, how far along". The status bar and settings only draw it. */
+	store = new Store();
 	private gw: Gateway | null = null;
 	private holder = new SessionHolder();
-	private status!: HTMLElement;
+	private connector!: Connector;
 	private binder!: EditorBinder;
 	private pending: { verifier: string } | null = null;
 
 	async onload() {
-		this.data = { ...EMPTY, ...(await this.loadData()) };
+		const raw = ((await this.loadData()) ?? {}) as Record<string, unknown>;
+		this.data = await migrateLegacy(raw, this.fileStore(), this.manifest.dir!);
+		if ("notes" in raw || "notesVault" in raw || "connected" in raw) await this.saveData(this.data); // 0.2.x settings: the notes moved to their own file
 		this.user = this.data.user;
-		this.status = this.addStatusBarItem();
-		this.status.addClass("mod-clickable");
-		this.status.onClickEvent(() => this.openSettings());
+		this.store = new Store({ conn: this.data.user ? { kind: "idle", user: this.data.user, via: this.data.via } : { kind: "setup" }, want: this.data.want, vault: this.data.vault, vaults: "loading", providers: null });
+		this.connector = new Connector(this.store, {
+			holder: this.holder,
+			gateway: () => this.gateway(),
+			saved: () => ({ user: this.data.user, via: this.data.via }),
+			save: async (want) => {
+				this.data.want = want;
+				await this.saveData(this.data);
+			},
+			open: (hooks) => this.openSession(hooks),
+			poke: () => this.holder.current?.remote.goOnline(),
+		});
+
+		const status = this.addStatusBarItem();
+		status.addClass("mod-clickable");
+		status.onClickEvent(() => this.openSettings());
+		let was = "";
+		const draw = () => {
+			const s = this.store.get();
+			status.setText(`agent-wiki: ${describeState(s).bar}`);
+			if (s.conn.kind === "stopped" && was !== "stopped") new Notice(`agent-wiki: ${s.conn.reason}`, 15000);
+			was = s.conn.kind;
+		};
+		this.register(this.store.subscribe(draw));
+		draw();
+
 		this.binder = new EditorBinder(this.app, () => this.holder.current?.vs ?? null);
 		this.registerEditorExtension(this.binder.extension);
 		this.addSettingTab(new LiveSettingTab(this.app, this));
 		this.registerObsidianProtocolHandler("agent-wiki-live-signin", (params) => void this.finishRedirect(params.code));
-		this.addCommand({ id: "reconnect", name: "Reconnect to agent-wiki", callback: () => void this.connect() });
-		this.render("not connected");
-		this.app.workspace.onLayoutReady(() => {
-			if (this.data.connected && this.data.vault) void this.connect();
-			else void this.refreshSignIn();
-		});
+		this.addCommand({ id: "reconnect", name: "Reconnect to agent-wiki", callback: () => void this.connector.reconnect() });
+		this.registerDomEvent(window, "online", () => this.connector.lifecycle("online"));
+		this.registerDomEvent(document, "visibilitychange", () => document.visibilityState === "visible" && this.connector.lifecycle("foreground"));
+		this.app.workspace.onLayoutReady(() => this.connector.lifecycle("layout-ready"));
 	}
 
 	onunload() {
-		void this.disconnect(false);
+		this.connector?.dispose(); // closes the session; the saved wish to be connected stays
+	}
+
+	// ------------------------------------------------------------------ what the settings tab asks of the plugin
+
+	setUrl(url: string) {
+		this.data.url = url;
+		void this.saveData(this.data);
+	}
+
+	/** Ask the server about this device's sign-in, its sign-in methods and (when signed in) vaults; the answers go to the store. */
+	refresh() {
+		void (async () => {
+			const who = await this.connector.checkSignIn();
+			void this.connector.loadProviders();
+			if (who.kind === "signed_in") await this.connector.loadVaults();
+		})();
+	}
+
+	async checkServer() {
+		this.store.dispatch({ t: "providers", list: (await this.gateway().providers()).providers });
+	}
+
+	async selectVault(name: string) {
+		const c = this.store.get().conn.kind;
+		if (name !== this.data.vault && (c === "live" || c === "connecting")) await this.connector.want(false); // the open connection is to the old vault
+		this.data.vault = name;
+		await this.saveData(this.data);
+		this.store.dispatch({ t: "vault", name });
+	}
+
+	/** The one button of the connection row. */
+	async act(action: Action) {
+		if (action === "connect") await this.connector.want(true);
+		else if (action === "disconnect" || action === "cancel") await this.connector.want(false);
+		else if (action === "retry") this.connector.retryNow();
+		else if (action === "signInAgain") await this.signInAgain();
 	}
 
 	gateway() {
@@ -58,7 +112,7 @@ export default class AgentWikiLive extends Plugin {
 			this.gw = new Gateway(this.data.url, http);
 			this.gw.device = `Obsidian · ${this.app.vault.getName()}`;
 			this.gw.session = this.data.session;
-			this.gw.onSignedOut = () => void this.lostSession();
+			this.gw.onSignedOut = () => this.lostSession();
 		}
 		return this.gw;
 	}
@@ -70,23 +124,6 @@ export default class AgentWikiLive extends Plugin {
 		setting?.openTabById(this.manifest.id);
 	}
 
-	/** Ask the server whether this device is signed in, and show the truth in the status bar and settings. */
-	async refreshSignIn(): Promise<SignInState> {
-		if (!this.data.url) return this.setSignIn({ kind: "not_set_up" });
-		return this.setSignIn(await probe(() => this.gateway().whoami(), { user: this.data.user, via: this.data.via }));
-	}
-
-	private setSignIn(s: SignInState): SignInState {
-		this.signin = s;
-		if (!(this.connected && s.kind === "signed_in")) this.render(describe(s).bar);
-		return s;
-	}
-
-	private render(text: string) {
-		this.statusText = text;
-		this.status.setText(`agent-wiki: ${text}`);
-	}
-
 	// ------------------------------------------------------------------ sign-in
 
 	private async signedIn(who: { name: string; via?: string }) {
@@ -94,11 +131,9 @@ export default class AgentWikiLive extends Plugin {
 		this.data.via = who.via ?? this.data.via;
 		this.data.session = this.gateway().session;
 		await this.saveData(this.data);
-		this.signin = { kind: "signed_in", user: who.name, via: this.data.via };
 		new Notice(`Signed in as ${who.name}.`);
-		// the edits kept while signed out sync again now
-		if (this.data.connected && this.data.vault && !this.connected) void this.connect();
-		else if (!this.connected) this.render("signed in");
+		this.connector.signedIn(who); // the edits kept while signed out sync again now
+		void this.connector.loadVaults();
 	}
 
 	async signInToken(token: string) {
@@ -135,12 +170,12 @@ export default class AgentWikiLive extends Plugin {
 	}
 
 	async signOut() {
-		await this.disconnect();
+		await this.connector.want(false);
 		await this.gateway().signOut();
-		this.data = { ...this.data, token: "", session: "", user: "", via: "", connected: false };
+		this.data = { ...this.data, token: "", session: "", user: "", via: "", want: false };
 		this.user = "";
-		this.signin = { kind: "not_set_up" };
-		this.render(describe(this.signin).bar);
+		this.store.dispatch({ t: "signin", result: { kind: "not_set_up" } });
+		this.store.dispatch({ t: "vaults", list: "loading" });
 		await this.saveData(this.data);
 	}
 
@@ -149,8 +184,8 @@ export default class AgentWikiLive extends Plugin {
 	 * not signed in again by itself: that would undo a revoke. The person is told, with one button.
 	 */
 	private lostSession() {
-		if (this.signin.kind === "ended") return;
-		this.setSignIn({ kind: "ended", user: this.data.user, via: this.data.via });
+		if (this.store.get().conn.kind === "signed_out") return;
+		this.connector.signedOut();
 		new Notice("agent-wiki: your sign-in on this device ended. Click the status bar to sign in again; your edits are kept.", 15000);
 	}
 
@@ -168,63 +203,56 @@ export default class AgentWikiLive extends Plugin {
 
 	// ------------------------------------------------------------------ the live vault
 
-	get stateStore(): StatePort {
-		return vaultState(this.data, () => void this.saveData(this.data));
-	}
-
-	/** Open the live connection; a Reconnect while one is opening joins it, and a new one replaces the old. */
-	async connect() {
-		try {
-			await this.holder.connect(() => this.openSession());
-		} catch (e) {
-			if (!(e instanceof Handled)) throw e;
-		}
-	}
-
-	private async openSession(): Promise<LiveSession> {
-		const fail = (msg: string, ms = 15000): never => {
-			this.connected = false;
-			this.render("not connected");
-			new Notice(`agent-wiki: ${msg}`, ms);
-			throw new Handled();
+	/** The plugin folder's files, through the vault adapter (works on desktop and on phones). */
+	private fileStore(): FileStore {
+		const a = this.app.vault.adapter;
+		return {
+			read: async (p) => ((await a.exists(p)) ? a.read(p) : null),
+			write: (p, t) => a.write(p, t),
+			rename: async (from, to) => {
+				if (await a.exists(to)) await a.remove(to);
+				await a.rename(from, to);
+			},
+			remove: (p) => a.remove(p),
 		};
-		this.connected = false;
-		if (!this.data.url || !this.data.vault) {
-			new Notice("Choose a server and a vault in the plugin settings first.");
-			throw new Handled();
-		}
+	}
+
+	/**
+	 * Opens the live session for the connector: the socket and the file index first (then the vault is usable), the
+	 * engine's first pass in the background. Anything the person must be told goes through `hooks`; the connector decides what it means.
+	 */
+	private async openSession(hooks: OpenHooks): Promise<LiveSession> {
+		if (!this.data.url || !this.data.vault) throw new Refusal("Choose a server and a vault in the plugin settings first.");
 		const g = this.gateway();
-		let remote: HocuspocusRemote | null = null;
+		const info = (await g.vaults()).find((v) => v.name === this.data.vault);
+		if (!info) throw new Refusal(`You cannot open "${this.data.vault}" (it may not be live, or you have no access).`);
+		hooks.phase("index");
+		const remote = new HocuspocusRemote({
+			url: g.wsUrl,
+			vault: info.name,
+			user: this.user,
+			token: async () => (await g.ticket(info.name)).ticket,
+			fileOps: g.fileOps(info.name),
+			readOnly: info.read_only,
+			onRefused: (reason) => hooks.refused(reason),
+			onStatus: (s) => hooks.socket(s === "connected"),
+		});
 		try {
-			const state = await this.refreshSignIn();
-			if (state.kind !== "signed_in") throw new Handled(); // the status bar already says why; edits stay on this device
-			const info = (await g.vaults()).find((v) => v.name === this.data.vault);
-			if (!info) throw new Error(`You cannot open "${this.data.vault}" (it may not be live, or you have no access).`);
-			this.render("connecting…");
-			remote = new HocuspocusRemote({
-				url: g.wsUrl,
-				vault: info.name,
-				user: this.user,
-				token: async () => (await g.ticket(info.name)).ticket,
-				fileOps: g.fileOps(info.name),
-				readOnly: info.read_only,
-				onRefused: (reason) => { this.render(`stopped: ${reason}`); new Notice(`agent-wiki: ${reason}`); },
-				onStatus: (s) => this.render(s === "connected" ? (info.read_only ? "connected (read only)" : "connected") : s),
-			});
-			await remote.synced();
-			const vs = new VaultSync(new VaultDisk(this.app), remote, this.stateStore, { notify: (n) => new Notice(n.message, 12000), log: (m, d) => console.debug("[agent-wiki-live]", m, d) }, { isOpen: (p) => this.binder.openPaths().has(p), device: Platform.isMobile ? "phone" : "desktop" });
-			await vs.start();
+			await remote.synced(undefined, hooks.signal); // gives up at once when cancelled or refused, instead of after the index timeout
+			const notes = await NoteFile.open(this.fileStore(), this.manifest.dir!, info.name);
+			hooks.signal.throwIfAborted();
+			const vs = new VaultSync(new VaultDisk(this.app), remote, notes, { notify: (n) => new Notice(n.message, 12000), log: (m, d) => console.debug("[agent-wiki-live]", m, d), progress: hooks.progress, attachFailed: hooks.attachFailed }, { isOpen: (p) => this.binder.openPaths().has(p), device: Platform.isMobile ? "phone" : "desktop" });
+			await vs.start(); // returns once the first pass is queued: the vault is live, its notes attach in the background
 			const session = new LiveSession(remote, vs);
+			session.own(() => void notes.flush().catch((e) => console.debug("[agent-wiki-live] saving note memory failed", e)));
 			this.watch(session);
-			this.connected = true;
-			this.data.connected = true;
-			await this.saveData(this.data);
-			this.render(`${info.read_only ? "connected (read only)" : "connected"} · ${vs.size} notes`);
+			let live = 0;
+			remote.index.forEach((e) => !e.deleted && live++);
+			hooks.live(info.read_only, live);
 			return session;
 		} catch (e) {
-			remote?.destroy();
-			if (e instanceof Handled) throw e;
-			return fail(e instanceof NonEmptyFolderError ? e.message : (e as Error).message);
+			remote.destroy();
+			throw e;
 		}
 	}
 
@@ -248,17 +276,4 @@ export default class AgentWikiLive extends Plugin {
 		session.own(() => this.binder.unbindAll());
 		bind();
 	}
-
-	async disconnect(persist = true) {
-		await this.holder.disconnect();
-		this.connected = false;
-		if (persist) {
-			this.data.connected = false;
-			await this.saveData(this.data);
-		}
-		this.render("not connected");
-	}
 }
-
-/** A failure already reported to the person (a notice or the status bar). */
-class Handled extends Error {}

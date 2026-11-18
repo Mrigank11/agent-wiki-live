@@ -1,104 +1,155 @@
 import { Notice, PluginSettingTab, Setting, type App } from "obsidian";
-import type { ProviderInfo, VaultInfo } from "../live/gateway.ts";
-import { describe } from "../live/signin.ts";
-import type AgentWikiLive from "../main.ts";
+import type { ProviderInfo } from "../live/gateway.ts";
+import { methodName } from "../live/signin.ts";
+import { describe, type Action, type Store } from "../state/connection.ts";
 
+/** What the settings tab needs from the plugin: the one store to draw, and the actions a person can take. */
+export interface SettingsHost {
+	store: Store;
+	data: { url: string };
+	setUrl(url: string): void;
+	/** Ask the server about sign-in, sign-in methods and vaults; the answers arrive in the store. */
+	refresh(): void;
+	/** The Check button: ask the server which ways in it offers. */
+	checkServer(): Promise<void>;
+	signInToken(token: string): Promise<void>;
+	signInProvider(p: ProviderInfo): Promise<void>;
+	signOut(): Promise<void>;
+	selectVault(name: string): Promise<void>;
+	/** The one button of the connection row. */
+	act(action: Action): Promise<void>;
+}
+
+/**
+ * Draws the connection store and nothing else. `display()` is synchronous: it subscribes, asks the plugin to
+ * refresh, and draws what the store holds right now; every change in the store draws the whole tab again
+ * (keeping focus and what was typed), except a progress tick, which only moves the numbers: the buttons are not replaced, so a
+ * click that is under way is not lost. It holds no state of its own about the connection, so it cannot disagree with the status bar.
+ */
 export class LiveSettingTab extends PluginSettingTab {
-	private plugin: AgentWikiLive;
-	private providers: ProviderInfo[] | null = null;
-	private vaults: VaultInfo[] | null = null;
+	private host: SettingsHost;
+	private unsubscribe: (() => void) | null = null;
 	private tokenText = "";
+	/** What the tab was last drawn from (without the progress numbers), and the two elements a progress tick moves. */
+	private drawnKey = "";
+	private moving: { desc: HTMLElement; bar?: HTMLProgressElement } | null = null;
 
-	constructor(app: App, plugin: AgentWikiLive) {
-		super(app, plugin);
-		this.plugin = plugin;
+	constructor(app: App, host: SettingsHost & { manifest?: unknown }) {
+		super(app, host as never);
+		this.host = host;
 	}
 
 	display() {
+		this.unsubscribe?.();
+		this.unsubscribe = this.host.store.subscribe(() => this.onStoreChange());
+		this.host.refresh();
+		this.draw();
+	}
+
+	hide() {
+		this.unsubscribe?.();
+		this.unsubscribe = null;
+	}
+
+	/** The structure on screen: everything the tab is drawn from except how far along the progress is. */
+	private keyOf(): string {
+		const s = this.host.store.get();
+		const c = s.conn;
+		const copy = describe(s);
+		return JSON.stringify([c.kind, "user" in c ? [c.user, c.via] : null, copy.title, copy.primary, copy.warn, !!copy.progress, copy.progress ? "" : copy.detail, s.vault, s.vaults, s.providers]);
+	}
+
+	/** A change in the store: draw the tab again, unless only the progress moved. */
+	private onStoreChange() {
+		if (this.moving && this.keyOf() === this.drawnKey) {
+			const copy = describe(this.host.store.get());
+			this.moving.desc.setText(copy.detail);
+			if (this.moving.bar && copy.progress) {
+				this.moving.bar.value = copy.progress.done;
+				this.moving.bar.max = copy.progress.total;
+			}
+			return;
+		}
+		this.draw();
+	}
+
+	private draw() {
 		const el = this.containerEl;
+		this.drawnKey = this.keyOf();
+		this.moving = null;
+		// keep the cursor where the person had it
+		const doc = (el as unknown as { ownerDocument?: Document }).ownerDocument;
+		const active = doc?.activeElement as HTMLInputElement | null;
+		const key = active && el.contains?.(active) ? active.dataset?.key : undefined;
+		const caret = key ? [active!.selectionStart, active!.selectionEnd] : null;
+
 		el.empty();
-		const p = this.plugin;
-		const d = p.data;
+		const h = this.host;
+		const s = h.store.get();
+		const c = s.conn;
 		el.createEl("h2", { text: "agent-wiki Live" });
 		el.createEl("p", { text: "Edit your agent-wiki vault together with other people and agents. This Obsidian vault must be new and empty: it becomes a live copy of one agent-wiki vault.", cls: "setting-item-description" });
 
-		new Setting(el).setName("Server address").setDesc("The address of your agent-wiki server, for example https://wiki.example.com").addText((t) => t.setValue(d.url).setPlaceholder("https://…").onChange(async (v) => { d.url = v.trim(); await p.saveData(d); }))
-			.addButton((b) => b.setButtonText("Check").onClick(async () => {
-				try {
-					this.providers = (await p.gateway().providers()).providers;
-					new Notice("Server found.");
-					this.checked = false;
-					this.display();
-				} catch (e) {
-					new Notice(`Could not reach the server: ${(e as Error).message}`);
-				}
-			}));
+		new Setting(el).setName("Server address").setDesc("The address of your agent-wiki server, for example https://wiki.example.com")
+			.addText((t) => { t.inputEl.dataset.key = "url"; t.setValue(h.data.url).setPlaceholder("https://…").onChange((v) => h.setUrl(v.trim())); })
+			.addButton((b) => b.setButtonText("Check").onClick(() => void h.checkServer().then(() => new Notice("Server found."), (e) => new Notice(`Could not reach the server: ${(e as Error).message}`))));
 
-		const st = p.signin;
-		// Ask the server, not the saved name; show the answer when it differs from what is drawn.
-		if (!this.checked) {
-			this.checked = true;
-			void p.refreshSignIn().then((now) => now.kind !== st.kind && this.display());
-		}
-		if (!this.providers && d.url && !this.fetching) {
-			this.fetching = true;
-			void p.gateway().providers().then((r) => { this.providers = r.providers; this.display(); }).catch(() => {});
-		}
-		const c = describe(st);
-		if (st.kind === "not_set_up") {
+		if (c.kind === "setup") {
 			this.signInForm(el);
+		} else if (c.kind === "signed_out") {
+			const copy = describe(s);
+			const row = new Setting(el).setName(copy.title).setDesc(copy.detail);
+			row.settingEl.addClass("mod-warning");
+			row.addButton((b) => b.setButtonText(copy.primary!.label).setCta().onClick(() => void h.act(copy.primary!.action)));
+			new Setting(el).setName("Use a different account").setDesc("Forget this sign-in and start over.").addButton((b) => b.setButtonText("Sign out").onClick(() => void h.signOut()));
 		} else {
-			const row = new Setting(el).setName(c.title).setDesc(c.detail);
-			if (c.warn) row.settingEl.addClass("mod-warning");
-			if (st.kind === "ended") {
-				row.addButton((b) => b.setButtonText(c.action!).setCta().onClick(async () => { await p.signInAgain(); this.display(); }));
-				new Setting(el).setName("Use a different account").setDesc("Forget this sign-in and start over.").addButton((b) => b.setButtonText("Sign out").onClick(async () => { await p.signOut(); this.display(); }));
-			} else if (st.kind === "unreachable") {
-				row.addButton((b) => b.setButtonText(c.action!).onClick(async () => { await p.refreshSignIn(); this.display(); }));
-			} else {
-				row.addButton((b) => b.setButtonText("Sign out").onClick(async () => { await p.signOut(); this.display(); }));
+			new Setting(el).setName(`Signed in as ${c.user} via ${methodName(c.via)} · this device`).setDesc("This device stays signed in until you sign it out here or an admin does.")
+				.addButton((b) => b.setButtonText("Sign out").onClick(() => void h.signOut()));
+			this.vaultPicker(el);
+			const copy = describe(s);
+			const row = new Setting(el).setName(copy.title).setDesc(copy.detail);
+			let bar: HTMLProgressElement | undefined;
+			if (copy.progress) {
+				bar = row.settingEl.createEl("progress", { cls: "agent-wiki-progress", attr: { value: copy.progress.done, max: copy.progress.total } });
+				bar.value = copy.progress.done;
+				bar.max = copy.progress.total;
 			}
-			if (st.kind === "signed_in") void this.vaultPicker(el);
+			this.moving = { desc: row.descEl, bar };
+			const primary = copy.primary!;
+			row.addButton((b) => b.setButtonText(primary.label).setCta().setDisabled(primary.action === "connect" && !s.vault).onClick(() => void h.act(primary.action)));
+		}
+
+		if (key) {
+			const again = el.querySelector?.(`[data-key="${key}"]`) as HTMLInputElement | null;
+			again?.focus();
+			if (caret && caret[0] !== null) again?.setSelectionRange?.(caret[0], caret[1]);
 		}
 	}
 
-	private checked = false;
-	private fetching = false;
-
-	/** Every way the server offers, shown at once: no Check press needed. */
+	/** Every way in the server offers, shown at once: no Check press needed. */
 	private signInForm(el: HTMLElement) {
-		const p = this.plugin;
-		for (const prov of this.providers ?? []) {
-			new Setting(el).setName(`Sign in with ${prov.name}`).addButton((b) => b.setButtonText(prov.name).onClick(() => p.signInProvider(prov).then(() => this.display())));
+		const h = this.host;
+		const providers = h.store.get().providers;
+		for (const prov of Array.isArray(providers) ? providers : []) {
+			new Setting(el).setName(`Sign in with ${prov.name}`).addButton((b) => b.setButtonText(prov.name).onClick(() => void h.signInProvider(prov)));
 		}
-		new Setting(el).setName("Token").setDesc("The token an admin gave you. Kept on this device in the plugin's data file, in plain text.").addText((t) => { t.inputEl.type = "password"; t.onChange((v) => (this.tokenText = v)); })
-			.addButton((b) => b.setButtonText("Sign in").setCta().onClick(() => p.signInToken(this.tokenText).then(() => this.display())));
-		if (!this.providers && p.data.url) el.createEl("p", { text: "Looking for the sign-in methods the server offers…", cls: "setting-item-description" });
+		new Setting(el).setName("Token").setDesc("The token an admin gave you. Kept on this device in the plugin's data file, in plain text.")
+			.addText((t) => { t.inputEl.type = "password"; t.inputEl.dataset.key = "token"; t.setValue(this.tokenText).onChange((v) => (this.tokenText = v)); })
+			.addButton((b) => b.setButtonText("Sign in").setCta().onClick(() => void h.signInToken(this.tokenText)));
+		if (providers === "loading" && h.data.url) el.createEl("p", { text: "Looking for the sign-in methods the server offers…", cls: "setting-item-description" });
 	}
 
-	private async vaultPicker(el: HTMLElement) {
-		const p = this.plugin;
-		const d = p.data;
-		if (!this.vaults) {
-			try {
-				this.vaults = await p.gateway().vaults();
-			} catch (e) {
-				el.createEl("p", { text: `Could not list vaults: ${(e as Error).message}` });
-				return;
-			}
-		}
-		const s = new Setting(el).setName("agent-wiki vault").setDesc(this.vaults.length ? "Only live vaults you may open are listed." : "No live vault is available to you.");
-		s.addDropdown((dd) => {
+	private vaultPicker(el: HTMLElement) {
+		const h = this.host;
+		const { vaults, vault } = h.store.get();
+		const row = new Setting(el).setName("agent-wiki vault");
+		if (vaults === "loading") return void row.setDesc("Looking for your vaults…");
+		if ("error" in vaults) return void row.setDesc(`Could not list vaults: ${vaults.error}`);
+		row.setDesc(vaults.length ? "Only live vaults you may open are listed." : "No live vault is available to you.");
+		row.addDropdown((dd) => {
 			dd.addOption("", "Choose…");
-			for (const v of this.vaults!) dd.addOption(v.name, v.read_only ? `${v.name} (read only)` : v.name);
-			dd.setValue(d.vault).onChange(async (v) => {
-				if (v !== d.vault && p.connected) await p.disconnect(); // the open connection is to the old vault
-				d.vault = v;
-				await p.saveData(d);
-				this.display();
-			});
+			for (const v of vaults) dd.addOption(v.name, v.read_only ? `${v.name} (read only)` : v.name);
+			dd.setValue(vault).onChange((v) => void h.selectVault(v));
 		});
-		new Setting(el).setName(p.connected ? "Connected" : "Not connected").setDesc(p.statusText)
-			.addButton((b) => b.setButtonText(p.connected ? "Disconnect" : "Connect").setCta().onClick(async () => { if (p.connected) await p.disconnect(); else await p.connect(); this.display(); }));
 	}
 }

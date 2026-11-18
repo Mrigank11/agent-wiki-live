@@ -59,13 +59,13 @@ export class LiveSession {
 }
 
 /** Holds the one current session. Connect is single-flight; a disconnect during a connect wins. */
-export class SessionHolder {
-	current: LiveSession | null = null;
+export class SessionHolder<S extends { stop(): void } = LiveSession> {
+	current: S | null = null;
 	private flight: Promise<void> | null = null;
 	private generation = 0;
 
 	/** Open a session with `open`, replacing the current one. A call made while one is opening joins it. */
-	connect(open: () => Promise<LiveSession>): Promise<void> {
+	connect(open: () => Promise<S>): Promise<void> {
 		if (this.flight) return this.flight;
 		const gen = this.generation;
 		const run = (async () => {

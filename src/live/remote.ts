@@ -94,12 +94,25 @@ export class HocuspocusRemote implements RemotePort {
 		return p;
 	}
 
-	/** Resolves once the file index has arrived. */
-	synced(timeoutMs = 20000): Promise<void> {
+	/** Resolves once the file index has arrived. Rejects when `signal` aborts, or when the server does not answer in time. */
+	synced(timeoutMs = 20000, signal?: AbortSignal): Promise<void> {
 		return new Promise((ok, bad) => {
-			const t = setTimeout(() => bad(new Error("the sync server did not answer")), timeoutMs);
-			this.syncedOf.get(this.indexProvider)!.then(() => {
+			const done = () => {
 				clearTimeout(t);
+				signal?.removeEventListener("abort", onAbort);
+			};
+			const onAbort = () => {
+				done();
+				bad(new Error("cancelled"));
+			};
+			const t = setTimeout(() => {
+				done();
+				bad(new Error("the sync server did not answer"));
+			}, timeoutMs);
+			if (signal?.aborted) return onAbort();
+			signal?.addEventListener("abort", onAbort);
+			this.syncedOf.get(this.indexProvider)!.then(() => {
+				done();
 				ok();
 			});
 		});
