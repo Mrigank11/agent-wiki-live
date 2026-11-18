@@ -1,4 +1,5 @@
 import type * as Y from "yjs";
+import { fingerprint } from "./fingerprint.ts";
 import { NoteSync } from "./NoteSync.ts";
 import type { DiskPort, Hooks, IndexEntry, LiveNote, NoteRecord, RemotePort, StatePort } from "./types.ts";
 
@@ -50,6 +51,15 @@ export class VaultSync {
 	private unlistenResync: (() => void) | null = null;
 	/** The first full attach: the first index pass and the one after it. */
 	private firstPass: Promise<void> = Promise.resolve();
+	/**
+	 * Notes this device holds exactly as the server does: the text it saved is on disk and its fingerprint is the server's. They
+	 * are not opened (no request, no live copy) until something changes: the server's fingerprint moves, or a file event says the
+	 * file did. Then the note is opened the ordinary way, so nothing it knows is trusted beyond that comparison.
+	 */
+	/** Notes whose deletion this device asked of the server and whose tombstone has not reached our copy of the index yet: they are not opened again meanwhile. */
+	private sentDeletes = new Set<string>();
+	private dormant = new Map<string, { path: string; base: string; fp: string }>();
+	private readonly onRevs: (e: Y.YMapEvent<string>) => void;
 	/** Notes asked of the server whose answer has not been taken yet; stopping closes them. */
 	private opening = new Set<LiveNote>();
 	/** Notes this device renamed whose rename the server has not accepted yet (offline): the index's old path is not a remote move. */
@@ -73,6 +83,13 @@ export class VaultSync {
 		this.opts = opts;
 		this.records = { ...state.load() };
 		this.settleMs = opts.settleMs ?? 400;
+		this.onRevs = (e) => {
+			if (this.stopped) return;
+			for (const id of e.keysChanged) {
+				const d = this.dormant.get(id);
+				if (d && this.remote.revs?.get(id) !== d.fp) void this.onEvent(() => this.wake(id));
+			}
+		};
 		this.onIndex = (_e, tr) => {
 			if (this.stopped) return;
 			this.enqueue(() => this.syncIndex());
@@ -90,6 +107,16 @@ export class VaultSync {
 			if ((e as { status?: number })?.status !== 429) throw e;
 			this.pausedUntil = Date.now() + 60_000;
 			this.hooks.notify({ kind: "error", message: "agent-wiki refused new notes because too many identical ones were being created in a row. The plugin has paused creating notes for a minute; if this repeats, disconnect and check for a loop." });
+		}
+	}
+
+	/** Runs a change we make to a file ourselves with its path marked, so the file event it raises is not taken as a person's edit; the mark never outlives the change, even when it throws. */
+	private async quietly(path: string, fn: () => Promise<void>) {
+		this.quiet.add(path);
+		try {
+			await fn();
+		} finally {
+			this.quiet.delete(path);
 		}
 	}
 
@@ -118,6 +145,7 @@ export class VaultSync {
 		}
 		const first = this.enqueue(() => this.syncIndex(true));
 		this.remote.index.observe(this.onIndex as any);
+		this.remote.revs?.observe(this.onRevs as any);
 		// back online after a break: what was deleted, renamed or created here meanwhile has not reached the server yet
 		this.unlistenResync = this.remote.onResync?.(() => void this.onEvent(() => this.syncIndex())) ?? null;
 		// notes created during the first pass (files the server did not know) were not observed yet: attach them
@@ -133,11 +161,13 @@ export class VaultSync {
 		this.stopped = true;
 		this.unlistenResync?.();
 		this.remote.index.unobserve(this.onIndex as any);
+		this.remote.revs?.unobserve(this.onRevs as any);
 		this.saveNow(); // before the notes go: what we remember is what they know
 		for (const l of this.opening) l.destroy();
 		this.opening.clear();
 		for (const n of this.notes.values()) n.destroy();
 		this.notes.clear();
+		this.dormant.clear();
 	}
 
 	// ---------------------------------------------------------------- the file tree
@@ -160,18 +190,27 @@ export class VaultSync {
 		for (const r of Object.values(this.records)) unknown.delete(r.path);
 		for (const n of this.notes.values()) unknown.delete(n.path);
 
+		await this.findDormant(entries, localPaths);
 		const toAttach: { id: string; path: string }[] = [];
 		for (const [id, e] of entries) {
 			if (e.deleted) {
+				this.sentDeletes.delete(id);
 				await this.remoteDeleted(id);
 				continue;
 			}
 			claimed.add(e.path);
+			if (this.sentDeletes.has(id)) continue; // we deleted it; the index has not said so yet
+			const sleeping = this.dormant.get(id);
+			if (sleeping) {
+				if (e.path === sleeping.path && localPaths.has(sleeping.path) && this.remote.revs?.get(id) === sleeping.fp) continue; // as saved, as the server has it
+				this.wakeUp(id); // something moved: the ordinary attach looks at it
+			}
 			const known = this.notes.get(id);
 			if (known) {
 				if (this.unsentMoves.has(id)) {
 					// renamed here while the server could not be told: tell it now instead of undoing the rename
 					if (e.path !== known.path) await this.sendMove(id, e.path, known.path);
+					else this.unsentMoves.delete(id); // the index already agrees with the file: nothing is owed to the server
 					if (this.unsentMoves.has(id)) continue;
 				} else if (known.path !== e.path) {
 					await this.remoteMoved(id, known, e.path);
@@ -186,6 +225,7 @@ export class VaultSync {
 		await this.attachAll(toAttach, localPaths);
 		if (this.stopped) return;
 
+		for (const id of [...this.dormant.keys()]) if (!entries.has(id)) this.wakeUp(id); // the server has forgotten it entirely: the code below decides what that means for the file
 		// files on disk the server does not know
 		for (const p of localPaths) {
 			if (claimed.has(p) || this.quiet.has(p)) continue;
@@ -197,9 +237,7 @@ export class VaultSync {
 				delete this.records[was[0]];
 				const mine = await this.disk.read(p);
 				if (mine !== null && mine === was[1].base && !this.remote.readOnly) {
-					this.quiet.add(p);
-					await this.disk.remove(p);
-					this.quiet.delete(p);
+					await this.quietly(p, () => this.disk.remove(p));
 					continue;
 				}
 			}
@@ -211,9 +249,71 @@ export class VaultSync {
 
 		// notes we knew that are gone from the index and from disk
 		for (const id of Object.keys(this.records)) {
-			if (!entries.has(id) && !this.notes.has(id)) delete this.records[id];
+			if (!entries.has(id) && !this.notes.has(id) && !this.dormant.has(id)) delete this.records[id];
 		}
 		this.saveSoon();
+	}
+
+	/**
+	 * Which notes can stay as they are: the ones the device saved, whose file still holds exactly the saved text and whose text
+	 * has the fingerprint the server publishes. The three agree, so opening the note could only find them equal.
+	 */
+	private async findDormant(entries: Map<string, IndexEntry>, localPaths: Set<string>) {
+		const revs = this.remote.revs;
+		if (!revs) return;
+		const candidates: { id: string; path: string; base: string; want: string }[] = [];
+		for (const [id, e] of entries) {
+			const rec = this.records[id];
+			const want = revs.get(id);
+			if (e.deleted || !rec || want === undefined || this.notes.has(id) || this.dormant.has(id) || this.unsentMoves.has(id)) continue;
+			if (rec.path !== e.path || !localPaths.has(e.path) || this.quiet.has(e.path)) continue;
+			candidates.push({ id, path: e.path, base: rec.base, want });
+		}
+		const check = async (c: (typeof candidates)[number]) => {
+			try {
+				if ((await fingerprint(c.base)) !== c.want || (await this.disk.read(c.path)) !== c.base) return;
+				// the answers were awaited: only a note nobody touched meanwhile may sleep
+				if (this.stopped || this.notes.has(c.id) || revs.get(c.id) !== c.want) return;
+				this.dormant.set(c.id, { path: c.path, base: c.base, fp: c.want });
+				this.byPath.set(c.path, c.id);
+			} catch (e) {
+				this.hooks.log?.("could not compare a note with the server's fingerprint; it will be opened", String(e));
+			}
+		};
+		for (let i = 0; i < candidates.length; i += 32) await Promise.all(candidates.slice(i, i + 32).map(check));
+	}
+
+	/** Stop treating a note as sleeping, so the next attach pass opens it. */
+	private wakeUp(id: string) {
+		const d = this.dormant.get(id);
+		if (!d) return;
+		this.dormant.delete(id);
+		if (this.byPath.get(d.path) === id) this.byPath.delete(d.path);
+	}
+
+	/** Open a sleeping note now, the ordinary way (its file and live text are brought into agreement, whichever changed). */
+	private async wake(id: string) {
+		const d = this.dormant.get(id);
+		if (!d || this.stopped) return;
+		this.wakeUp(id);
+		const e = this.remote.index.get(id);
+		if (!e || e.deleted) return; // the index pass deals with a note that is gone
+		try {
+			await this.attachWindows([{ id, path: e.path }], new Set(await this.disk.list()), true);
+		} catch (err) {
+			// not opened: it is neither asleep nor open, so the next index pass (a resync, Reconnect) opens it
+			for (const live of this.opening) live.destroy();
+			this.opening.clear();
+			this.hooks.log?.("could not open a note that changed", String(err));
+		}
+	}
+
+	/** The note's live text, opening it first when it was asleep (the editor binds to it). */
+	open(path: string) {
+		return this.onEvent(async () => {
+			const id = this.byPath.get(path);
+			if (id && this.dormant.has(id)) await this.wake(id);
+		}).then(() => this.note(path));
 	}
 
 	/** The one file in `unknown` whose text is exactly `base`: a note renamed while Obsidian was closed (a rename is not told, only found). */
@@ -274,10 +374,11 @@ export class VaultSync {
 		}
 	}
 
-	private async attachWindows(items: { id: string; path: string }[], localPaths: Set<string>) {
+	private async attachWindows(items: { id: string; path: string }[], localPaths: Set<string>, quiet = false) {
 		const total = items.length;
 		if (!total || this.stopped) return;
-		this.hooks.progress?.(0, total);
+		const progress = quiet ? undefined : this.hooks.progress; // opening one changed note is not "syncing" the vault
+		progress?.(0, total);
 		const ask = (from: number) => {
 			const win = items.slice(from, from + ATTACH_WINDOW);
 			const lives = win.map((a) => {
@@ -300,7 +401,7 @@ export class VaultSync {
 					continue;
 				}
 				await this.finishAttach(now.win[k].id, now.win[k].path, now.lives[k], localPaths);
-				this.hooks.progress?.(++done, total);
+				progress?.(++done, total);
 			}
 			if (this.stopped) return;
 		}
@@ -320,9 +421,7 @@ export class VaultSync {
 
 		// where the file is: where the index says; if we knew it elsewhere and it is still there, it was renamed while we were away
 		if (rec && rec.path !== path && !localPaths.has(path) && localPaths.has(rec.path)) {
-			this.quiet.add(path);
-			await this.disk.rename(rec.path, path);
-			this.quiet.delete(path);
+			await this.quietly(path, () => this.disk.rename(rec.path, path));
 			localPaths.delete(rec.path);
 			localPaths.add(path);
 		}
@@ -332,6 +431,7 @@ export class VaultSync {
 				// nobody else changed it: the deletion is the person's
 				if (!this.remote.readOnly) {
 					await this.remote.deleteFile(path);
+					this.sentDeletes.add(id);
 					n.destroy();
 					this.notes.delete(id);
 					this.byPath.delete(path);
@@ -370,7 +470,8 @@ export class VaultSync {
 	private async remoteDeleted(id: string) {
 		const n = this.notes.get(id);
 		const rec = this.records[id];
-		const path = n?.path ?? rec?.path;
+		const path = n?.path ?? this.dormant.get(id)?.path ?? rec?.path;
+		this.wakeUp(id);
 		if (!path) return;
 		const disk = await this.disk.read(path);
 		const base = n?.base ?? rec?.base ?? null;
@@ -381,9 +482,7 @@ export class VaultSync {
 		if (disk === null) return;
 		const unsent = (n?.live.unsynced?.() ?? 0) > 0; // our own edits the server never saw
 		if (base !== null && disk === base && !unsent) {
-			this.quiet.add(path);
-			await this.disk.remove(path);
-			this.quiet.delete(path);
+			await this.quietly(path, () => this.disk.remove(path));
 		} else if (!this.remote.readOnly) {
 			// deleted on the server but edited here: keep the file, it becomes a new note
 			this.hooks.notify({ kind: "restored", message: `"${path}" was deleted elsewhere but you changed it here; kept.` });
@@ -398,9 +497,7 @@ export class VaultSync {
 		this.byPath.set(to, id);
 		if ((await this.disk.read(from)) !== null) {
 			if ((await this.disk.read(to)) === null) {
-				this.quiet.add(to);
-				await this.disk.rename(from, to);
-				this.quiet.delete(to);
+				await this.quietly(to, () => this.disk.rename(from, to));
 			}
 		}
 		n.moved(to);
@@ -457,7 +554,12 @@ export class VaultSync {
 				return;
 			}
 			this.echoes.delete(path);
-			await this.notes.get(id)!.onDisk(disk);
+			const asleep = this.dormant.get(id);
+			if (asleep) {
+				if (disk === asleep.base) return; // an event for text that is what we saved: nothing changed
+				return this.wake(id); // opening it brings the file's text and the server's together
+			}
+			await this.notes.get(id)?.onDisk(disk);
 		});
 	}
 
@@ -470,7 +572,9 @@ export class VaultSync {
 			if (this.quiet.has(path)) return;
 			const id = this.byPath.get(path);
 			if (!id) return;
-			const n = this.notes.get(id)!;
+			if (this.dormant.has(id)) return this.wake(id); // opening it finds the file gone and does what a deletion here means
+			const n = this.notes.get(id);
+			if (!n) return;
 			if (this.remote.readOnly || n.text !== n.base) {
 				// text changed elsewhere since the last agreement: bring the file back instead of deleting it for everyone
 				await n.onDisk(null);
@@ -491,7 +595,11 @@ export class VaultSync {
 			if (!id || this.remote.readOnly) return;
 			this.byPath.delete(from);
 			this.byPath.set(to, id);
-			this.notes.get(id)!.moved(to);
+			const asleep = this.dormant.get(id);
+			if (asleep) {
+				asleep.path = to;
+				this.saveSoon();
+			} else this.notes.get(id)?.moved(to);
 			await this.sendMove(id, from, to);
 		});
 	}
@@ -500,7 +608,7 @@ export class VaultSync {
 	ready(path: string) {
 		return this.onEvent(async () => {
 			const id = this.byPath.get(path);
-			if (id) await this.notes.get(id)!.reconcile(path);
+			if (id) await this.notes.get(id)?.reconcile(path);
 		});
 	}
 
@@ -510,7 +618,7 @@ export class VaultSync {
 	}
 
 	get size() {
-		return this.notes.size;
+		return this.notes.size + this.dormant.size;
 	}
 
 	// ---------------------------------------------------------------- remembering
@@ -526,11 +634,14 @@ export class VaultSync {
 	private saveNow() {
 		if (this.saveTimer) clearTimeout(this.saveTimer);
 		this.saveTimer = null;
-		const out: Record<string, NoteRecord> = {};
+		// attached notes report their own record; a note known but not attached yet (a save can fire mid-attach) keeps what we remembered
+		const out: Record<string, NoteRecord> = { ...this.records };
 		for (const [id, n] of this.notes) {
 			const r = n.record();
 			if (r) out[id] = r;
+			else delete out[id];
 		}
+		for (const [id, d] of this.dormant) out[id] = { path: d.path, base: d.base };
 		this.records = out;
 		this.state.save(out);
 	}

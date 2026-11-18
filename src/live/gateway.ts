@@ -24,6 +24,9 @@ export class GatewayError extends Error {
 const CSRF = "agent-wiki-admin";
 const API = "/api/app/v1";
 
+/** Two ways of writing a server address that mean the same server (spaces and trailing slashes do not count). */
+export const sameServer = (a: string, b: string) => a.trim().replace(/\/+$/, "") === b.trim().replace(/\/+$/, "");
+
 export const base64url = (b: Uint8Array) => btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
 /** A fresh secret for one sign-in and its challenge (the gateway keeps only the challenge until the code is traded). */
@@ -80,6 +83,7 @@ export class Gateway {
 			/* not JSON */
 		}
 		if (res.status >= 400) {
+			if (res.status === 401) this.cached.clear(); // the sign-in these tickets were bought with is over; the next one must not borrow them
 			if (res.status === 401 && !quiet401) this.onSignedOut();
 			const f = data?.findings?.[0];
 			throw new GatewayError(res.status, f?.rule ?? "http", f?.message ?? `The server answered ${res.status}`);
@@ -136,7 +140,51 @@ export class Gateway {
 			remove: async (path) => void (await op({ op: "delete", path })),
 		};
 	}
-	signOut() {
-		return this.call<void>("DELETE", "/session", undefined, true).catch(() => {});
+	/** Ends this sign-in: the server is told (best effort), and the cookie and every ticket are forgotten either way. */
+	async signOut() {
+		try {
+			await this.call<void>("DELETE", "/session", undefined, true);
+		} catch {
+			/* the server could not be told; this device forgets the sign-in regardless */
+		} finally {
+			this.clear();
+		}
+	}
+	/** Forget who this is: the cookie and the tickets belong to one sign-in on one server. */
+	clear() {
+		this.cookies.clear();
+		this.cached.clear();
+	}
+}
+
+/**
+ * The one gateway for the server address in the settings. A new address gets a new gateway with no cookie and no
+ * tickets: what belongs to the old server's sign-in is never sent to the new one.
+ */
+export class GatewayKeeper {
+	private gw: Gateway | null = null;
+	private http: Http;
+	private device: string;
+	/** Called when a request gets 401 on the current gateway. */
+	onSignedOut: () => void = () => {};
+	constructor(http: Http, device: string) {
+		this.http = http;
+		this.device = device;
+	}
+	/** `session` is the cookie saved on this device; it is for the first gateway only (the address it was saved for). */
+	get(url: string, session: string): Gateway {
+		const base = url.replace(/\/+$/, "");
+		if (this.gw && sameServer(this.gw.base, base)) return this.gw;
+		const first = this.gw === null;
+		this.gw?.clear();
+		const gw = (this.gw = new Gateway(url, this.http));
+		gw.device = this.device;
+		gw.session = first ? session : "";
+		gw.onSignedOut = () => this.gw === gw && this.onSignedOut();
+		return gw;
+	}
+	/** Forget the current gateway's sign-in (the address stays). */
+	clear() {
+		this.gw?.clear();
 	}
 }

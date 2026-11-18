@@ -91,7 +91,12 @@ export class LiveSettingTab extends PluginSettingTab {
 		el.createEl("p", { text: "Edit your agent-wiki vault together with other people and agents. This Obsidian vault must be new and empty: it becomes a live copy of one agent-wiki vault.", cls: "setting-item-description" });
 
 		new Setting(el).setName("Server address").setDesc("The address of your agent-wiki server, for example https://wiki.example.com")
-			.addText((t) => { t.inputEl.dataset.key = "url"; t.setValue(h.data.url).setPlaceholder("https://…").onChange((v) => h.setUrl(v.trim())); })
+			.addText((t) => {
+				t.inputEl.dataset.key = "url";
+				t.setValue(h.data.url).setPlaceholder("https://…");
+				// the address is committed when the field is left, not on every keystroke: a half-typed address is not a new server
+				t.inputEl.addEventListener("change", () => h.setUrl(t.inputEl.value.trim()));
+			})
 			.addButton((b) => b.setButtonText("Check").onClick(() => void h.checkServer().then(() => new Notice("Server found."), (e) => new Notice(`Could not reach the server: ${(e as Error).message}`))));
 
 		if (c.kind === "setup") {

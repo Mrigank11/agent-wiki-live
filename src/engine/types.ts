@@ -31,6 +31,8 @@ export interface LiveNote {
 export interface RemotePort {
 	/** The vault's file index (note id -> path). Already synced when the engine starts. */
 	index: Y.Map<IndexEntry>;
+	/** The server's fingerprint of each note's text (note id -> fingerprint), published beside the index. Absent when the server does not publish them: every note is then opened. */
+	revs?: Y.Map<string>;
 	openNote(id: string): LiveNote;
 	/** Create a note on the server; a name clash gets the next free name and `clash: true`. */
 	createFile(path: string, text: string): Promise<{ path: string; clash?: boolean }>;

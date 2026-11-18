@@ -17,6 +17,10 @@ export function setText(doc: Y.Doc, text: Y.Text, to: string, origin: unknown = 
 	return true;
 }
 
+/** How many past live texts an open note remembers, and the most characters they may add up to. */
+const RECENT_TEXTS = 32;
+const RECENT_CHARS = 2_000_000;
+
 /**
  * One note: keeps its file and its live text in agreement. `base` is the last text known to be on
  * disk and live at once; every decision is a three-way merge against it. All calls are made one at a
@@ -27,6 +31,12 @@ export class NoteSync {
 	base: string | null;
 	/** The last text we wrote to disk ourselves: the file event it causes is our own echo. */
 	private wrote: string | null = null;
+	/**
+	 * The last few live texts of an open note, newest last. Obsidian saves the editor's text some time after it was
+	 * typed, so a file read can show a text the live note has already moved past: that is Obsidian's own save, not an
+	 * outside edit.
+	 */
+	private recent: string[] = [];
 	private timer: ReturnType<typeof setTimeout> | null = null;
 	private off: () => void;
 	private dead = false;
@@ -61,11 +71,29 @@ export class NoteSync {
 		this.path = record?.path ?? "";
 		this.base = record ? record.base : null;
 		const obs = (_e: unknown, tr: Y.Transaction) => {
+			this.remember();
 			if (tr.origin === ORIGIN_DISK) return;
 			this.scheduleWrite();
 		};
 		live.text.observe(obs as any);
 		this.off = () => live.text.unobserve(obs as any);
+		this.remember();
+	}
+
+	/** Keep the live text in the bounded history (open notes only, so closed notes cost nothing). */
+	private remember() {
+		if (!this.opts.isOpen(this.path)) return this.recent.length && (this.recent = []);
+		const t = this.text;
+		if (this.recent[this.recent.length - 1] === t) return;
+		this.recent.push(t);
+		let size = 0;
+		for (let i = this.recent.length - 1; i >= 0; i--) {
+			size += this.recent[i].length;
+			if (this.recent.length - i > RECENT_TEXTS || (size > RECENT_CHARS && i < this.recent.length - 1)) {
+				this.recent.splice(0, i + 1);
+				break;
+			}
+		}
 	}
 
 	get text() {
@@ -114,6 +142,11 @@ export class NoteSync {
 		const live = this.text;
 		if (disk === null) return this.writeLive();
 		if (disk === live) return this.adopt(live);
+		// Obsidian saved a text the editor has typed past: its own save, not an outside edit; the newer live text is written later
+		if (this.opts.isOpen(this.path) && this.recent.includes(disk)) {
+			this.adopt(disk);
+			return this.scheduleWrite();
+		}
 		if (this.opts.readOnly) return; // never push a read-only person's file edits into live text
 		if (this.base === null) return this.divergent(disk); // first attach, texts differ: nothing is overwritten
 		const m = merge3Text(this.base, disk, live);

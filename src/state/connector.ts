@@ -85,13 +85,13 @@ export class Connector {
 	/** The person asks to be connected, or not. Resolves when it is done (connected, or given up for now). */
 	want(on: boolean): Promise<void> {
 		if (on) return this.connect(true);
-		this.gen++;
 		this.pending = null; // the wish is withdrawn: a later Connect is a new one, not a join
-		this.abortOpen(); // an open that is already waiting on the network gives up now, so Cancel does not wait for it
+		this.attempts = 0; // the waits start over for the next Connect
 		this.cancelRetry();
 		this.store.dispatch({ t: "want", on: false });
+		const ended = this.teardown(); // an open that is already waiting on the network gives up now, so Cancel does not wait for it
 		const run = this.ops.then(async () => {
-			await this.d.holder.disconnect();
+			await ended;
 			await this.d.save(false);
 		});
 		this.ops = run.catch(() => {});
@@ -130,8 +130,15 @@ export class Connector {
 
 	/** Ask the server whether this device is signed in, and show the answer. */
 	async checkSignIn() {
+		const gen = this.gen;
 		const r = await probe(() => this.d.gateway().whoami(), this.d.saved());
+		if (gen !== this.gen) return r; // a session started or ended while the server was answering: this answer is about the past and must not end the new one
 		this.store.dispatch({ t: "signin", result: r });
+		this.follow();
+		if (r.kind === "signed_in" && this.store.get().want) {
+			const k = this.store.get().conn.kind;
+			if (k === "offline" || k === "idle") void this.connect(false); // a wish that was waiting is pursued now that the server answers
+		}
 		return r;
 	}
 
@@ -163,11 +170,19 @@ export class Connector {
 
 	/** The server said 401. Not signed in again by itself: that would undo a revoke. */
 	signedOut() {
-		this.gen++;
-		this.abortOpen();
 		this.cancelRetry();
+		this.attempts = 0;
 		this.store.dispatch({ t: "signedOut" });
-		void this.d.holder.disconnect();
+		this.follow();
+	}
+
+	/** The server address was changed: the sign-in and the session belong to the old server. Everything ends there; the wish to be connected is kept. */
+	serverChanged() {
+		this.pending = null;
+		this.attempts = 0;
+		this.cancelRetry();
+		this.store.dispatch({ t: "server" });
+		this.follow();
 	}
 
 	/** "Try now": the waits start over. */
@@ -194,10 +209,25 @@ export class Connector {
 
 	dispose() {
 		this.disposed = true;
+		this.cancelRetry();
+		void this.teardown();
+	}
+
+	/**
+	 * The one way a session ends. A session exists only while the store says connecting or live; every exit (cancel,
+	 * 401, refused, dispose) comes through here, which drops the reports of the attempt that was running, tells its open
+	 * to give up, and stops the session.
+	 */
+	private teardown(): Promise<void> {
 		this.gen++;
 		this.abortOpen();
-		this.cancelRetry();
-		void this.d.holder.disconnect();
+		return this.d.holder.disconnect();
+	}
+
+	/** Keeps the invariant after any change to the store: no connection that is not connecting or live has a session. */
+	private follow() {
+		const k = this.store.get().conn.kind;
+		if (k !== "connecting" && k !== "live" && (this.d.holder.current || this.ctl)) void this.teardown();
 	}
 
 	// ------------------------------------------------------------------ one try
@@ -228,7 +258,7 @@ export class Connector {
 			socket: (up) => live(() => this.store.dispatch({ t: "socket", up }))(),
 			// the server said no: that is the answer. The open may still be waiting for an index that will never come; end it, and
 			// whatever it then reports (a timeout) is not a network drop
-			refused: (reason) => live(() => { this.refusedGen = gen; this.store.dispatch({ t: "refused", reason }); this.abortOpen(); })(),
+			refused: (reason) => live(() => { this.refusedGen = gen; this.store.dispatch({ t: "refused", reason }); this.cancelRetry(); void this.teardown(); })(),
 			attachFailed: () => live(() => this.store.dispatch({ t: "attachFailed" }))(),
 			signal,
 		};
@@ -255,7 +285,8 @@ export class Connector {
 		if (gen !== this.gen || gen === this.refusedGen || e instanceof Cancelled || e instanceof Stop) return;
 		if (e instanceof GatewayError && e.status === 401) return this.signedOut();
 		if (e instanceof Refusal || (e as Error)?.name === "NonEmptyFolderError" || (e instanceof GatewayError && e.status < 500)) {
-			return void this.store.dispatch({ t: "refused", reason: (e as Error).message });
+			this.store.dispatch({ t: "refused", reason: (e as Error).message });
+			return this.follow();
 		}
 		// the network, or a server that is down: keep what is on this device and try again
 		const wait = RETRY_SECONDS[Math.min(this.attempts, RETRY_SECONDS.length - 1)] * 1000;

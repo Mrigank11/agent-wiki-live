@@ -1,7 +1,7 @@
 import { Component, Notice, Platform, Plugin, requestUrl, TFile } from "obsidian";
 import { LiveSession, SessionHolder } from "./engine/LiveSession.ts";
 import { VaultSync } from "./engine/VaultSync.ts";
-import { Gateway, GatewayError, type Http, type ProviderInfo } from "./live/gateway.ts";
+import { GatewayKeeper, GatewayError, sameServer, type Http, type ProviderInfo } from "./live/gateway.ts";
 import { Connector, Refusal, type OpenHooks } from "./state/connector.ts";
 import { describe as describeState, Store, type Action } from "./state/connection.ts";
 import { HocuspocusRemote } from "./live/remote.ts";
@@ -20,7 +20,7 @@ export default class AgentWikiLive extends Plugin {
 	user = "";
 	/** The one answer to "am I signed in, am I connected, how far along". The status bar and settings only draw it. */
 	store = new Store();
-	private gw: Gateway | null = null;
+	private gws: GatewayKeeper | null = null;
 	private holder = new SessionHolder();
 	private connector!: Connector;
 	private binder!: EditorBinder;
@@ -74,8 +74,14 @@ export default class AgentWikiLive extends Plugin {
 	// ------------------------------------------------------------------ what the settings tab asks of the plugin
 
 	setUrl(url: string) {
+		const moved = !sameServer(url, this.data.url);
 		this.data.url = url;
-		void this.saveData(this.data);
+		if (moved) {
+			// the sign-in (cookie, name) belongs to the old server; the session goes with it, through the connector
+			this.data.session = this.data.user = this.data.via = this.user = "";
+			void this.saveData(this.data);
+			this.connector.serverChanged();
+		} else void this.saveData(this.data);
 	}
 
 	/** Ask the server about this device's sign-in, its sign-in methods and (when signed in) vaults; the answers go to the store. */
@@ -108,13 +114,11 @@ export default class AgentWikiLive extends Plugin {
 	}
 
 	gateway() {
-		if (!this.gw || this.gw.base !== this.data.url.replace(/\/+$/, "")) {
-			this.gw = new Gateway(this.data.url, http);
-			this.gw.device = `Obsidian · ${this.app.vault.getName()}`;
-			this.gw.session = this.data.session;
-			this.gw.onSignedOut = () => this.lostSession();
+		if (!this.gws) {
+			this.gws = new GatewayKeeper(http, `Obsidian · ${this.app.vault.getName()}`);
+			this.gws.onSignedOut = () => this.lostSession();
 		}
-		return this.gw;
+		return this.gws.get(this.data.url, this.data.session);
 	}
 
 	/** Opens this plugin's settings (the status bar's click, and the "sign in again" notice). */

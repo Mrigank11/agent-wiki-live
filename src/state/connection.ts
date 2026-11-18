@@ -25,6 +25,7 @@ export type State = { conn: Conn; want: boolean; vault: string; vaults: Vaults; 
 export type Event =
 	| { t: "signin"; result: SignInState }
 	| { t: "signedOut" }
+	| { t: "server" }
 	| { t: "want"; on: boolean }
 	| { t: "phase"; phase: Phase }
 	| { t: "progress"; done: number; total: number }
@@ -55,12 +56,17 @@ export function next(s: State, e: Event): State {
 			const who = { user: r.user, via: r.via };
 			// a check that cannot reach the server says nothing about a connection that is moving or already offline
 			if (r.kind === "unreachable") return c.kind === "connecting" || c.kind === "live" || c.kind === "offline" ? s : { ...s, conn: { kind: "offline", retryAt: 0, reason: "the server can't be reached", ...who } };
-			// signed in: tell a signed-out, set-up or offline screen; leave a connection that is already moving alone
+			// signed in: tell a signed-out or set-up screen; an offline connection that is wanted stays offline (the connector
+			// pursues the wish); leave a connection that is already moving alone
+			if (c.kind === "offline" && s.want) return { ...s, conn: { ...c, ...who } };
 			if (c.kind === "setup" || c.kind === "signed_out" || c.kind === "offline") return { ...s, conn: { kind: "idle", ...who } };
 			return { ...s, conn: { ...c, ...who } };
 		}
 		case "signedOut":
 			return { ...s, conn: { kind: "signed_out", ...w } };
+		case "server":
+			// a new server address: nobody is signed in there yet, and what the old server listed or offered is not its
+			return { ...s, conn: { kind: "setup" }, vaults: "loading", providers: null };
 		case "want": {
 			if (!e.on) {
 				const conn: Conn = signedIn(c) ? { kind: "idle", ...w } : c;
@@ -86,8 +92,8 @@ export function next(s: State, e: Event): State {
 		}
 		case "live": {
 			if (c.kind === "live") return { ...s, conn: { ...c, readOnly: e.readOnly, notes: e.notes } };
-			if (c.kind === "setup" || c.kind === "signed_out") return s;
-			const carried = c.kind === "connecting" && c.total > 0 && c.done < c.total ? { done: c.done, total: c.total } : undefined;
+			if (c.kind !== "connecting") return s; // a vault is live only after it was being connected: a late report cannot revive a stopped, offline or signed-out one
+			const carried = c.total > 0 && c.done < c.total ? { done: c.done, total: c.total } : undefined;
 			return { ...s, conn: { kind: "live", readOnly: e.readOnly, notes: e.notes, attaching: carried, socket: "up", ...w } };
 		}
 		case "attachFailed":
@@ -108,8 +114,13 @@ export function next(s: State, e: Event): State {
 	}
 }
 
+/** One thing that happened: the event and the kind of connection either side of it. */
+export type Logged = { event: Event["t"]; from: Conn["kind"]; to: Conn["kind"] };
+const LOG_SIZE = 100;
+
 export class Store {
 	private state: State;
+	private log: Logged[] = [];
 	private subs = new Set<(s: State) => void>();
 	constructor(state: State = initial()) {
 		this.state = state;
@@ -119,8 +130,15 @@ export class Store {
 	}
 	/** Applies the event and tells every subscriber before it returns. */
 	dispatch(e: Event) {
+		const from = this.state.conn.kind;
 		this.state = next(this.state, e);
+		this.log.push({ event: e.t, from, to: this.state.conn.kind });
+		if (this.log.length > LOG_SIZE) this.log.splice(0, this.log.length - LOG_SIZE);
 		for (const fn of [...this.subs]) fn(this.state);
+	}
+	/** The last events, oldest first: for tests and "copy debug info". */
+	events(): readonly Logged[] {
+		return this.log;
 	}
 	subscribe(fn: (s: State) => void): () => void {
 		this.subs.add(fn);

@@ -53,9 +53,10 @@ export class EditorBinder {
 	private async one(vs: VaultSync, view: MarkdownView, path: string) {
 		const cm = (view.editor as unknown as { cm?: EditorView }).cm;
 		if (!cm || this.bound.get(cm) === path) return;
-		const note = vs.note(path);
+		const note = vs.note(path) ?? (await vs.open(path)); // a note the vault is holding as it was saved is opened now: the editor needs its live text
 		if (!note) return this.unbind(cm);
 		await vs.ready(path); // merge any pending outside edit first, so the editor and live text agree
+		if (this.vs() !== vs) return; // the session was replaced while waiting: its text is dead, the next refresh binds the new one
 		if (cm.state.doc.toString() !== note.text) cm.dispatch({ changes: { from: 0, to: cm.state.doc.length, insert: note.text } });
 		const awareness = note.live.awareness ?? new Awareness(note.live.doc);
 		cm.dispatch({ effects: this.compartment.reconfigure(yCollab(note.live.text, awareness)) });

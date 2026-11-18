@@ -42,6 +42,7 @@ export function colorFor(name: string) {
 /** One socket per vault; the file index and every note ride on it (the same shape the web editor uses). */
 export class HocuspocusRemote implements RemotePort {
 	readonly index: Y.Map<IndexEntry>;
+	readonly revs: Y.Map<string>;
 	readOnly: boolean;
 	private socket: HocuspocusProviderWebsocket;
 	private indexProvider: HocuspocusProvider;
@@ -50,6 +51,8 @@ export class HocuspocusRemote implements RemotePort {
 	private syncedOf = new WeakMap<HocuspocusProvider, Promise<void>>();
 	private resyncs = new Set<() => void>();
 	private firstSync = true;
+	/** How many notes this connection has opened (a request to the server each): what a reconnect on an unchanged vault should keep at zero. */
+	readonly stats = { opened: 0 };
 
 	constructor(o: RemoteOptions) {
 		this.o = o;
@@ -61,6 +64,7 @@ export class HocuspocusRemote implements RemotePort {
 		this.socket.on("status", ({ status }: { status: string }) => o.onStatus?.(status as any));
 		const doc = new Y.Doc();
 		this.index = doc.getMap("files");
+		this.revs = doc.getMap("revs");
 		this.indexProvider = this.provider(`${o.vault}/__index`, doc, true);
 		this.indexProvider.on("synced", () => {
 			if (this.firstSync) return void (this.firstSync = false);
@@ -119,6 +123,7 @@ export class HocuspocusRemote implements RemotePort {
 	}
 
 	openNote(id: string): LiveNote {
+		this.stats.opened++;
 		const doc = new Y.Doc();
 		const p = this.provider(`${this.o.vault}/${id}`, doc);
 		this.open.set(id, p);
