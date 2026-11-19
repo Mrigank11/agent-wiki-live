@@ -128,12 +128,16 @@ export class HocuspocusRemote implements RemotePort {
 		const p = this.provider(`${this.o.vault}/${id}`, doc);
 		this.open.set(id, p);
 		const synced = this.syncedOf.get(p)!;
+		let handshaken = false;
+		p.on("unsyncedChanges", ({ number }: { number: number }) => void (number === 0 && (handshaken = true)));
 		return {
 			doc,
 			text: doc.getText("content"),
 			synced,
 			awareness: p.awareness,
-			unsynced: () => p.unsyncedChanges,
+			// opening the note is itself one unacknowledged exchange until the server first answers: not a change of ours
+			unsynced: () => (handshaken ? p.unsyncedChanges : Math.max(0, p.unsyncedChanges - 1)),
+			onUnsynced: (cb: () => void) => void p.on("unsyncedChanges", cb),
 			destroy: () => {
 				p.destroy();
 				doc.destroy();

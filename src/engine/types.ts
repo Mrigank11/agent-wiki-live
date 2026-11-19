@@ -24,6 +24,8 @@ export interface LiveNote {
 	awareness?: import("y-protocols/awareness").Awareness | null;
 	/** How many of our own changes the server has not acknowledged yet. */
 	unsynced?(): number;
+	/** Told every time that number changes (a local edit, the server's acknowledgement). */
+	onUnsynced?(cb: () => void): void;
 	destroy(): void;
 }
 

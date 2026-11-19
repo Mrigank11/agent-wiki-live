@@ -6,3 +6,11 @@
 
 /* connecting: "212 of 592 notes" as a bar under the connection row's words */
 .agent-wiki-progress { width: 100%; margin-top: 8px; }
+
+/* sync indicator: one small icon among the note's header actions. Quiet by default; only a conflict or an unreachable server is drawn in the warning colour. */
+.view-action.agent-wiki-sync { opacity: 0.4; }
+.view-action.agent-wiki-sync:hover { opacity: 1; }
+.view-action.agent-wiki-sync[data-sync="none"] { display: none; }
+.view-action.agent-wiki-sync[data-sync="offline"] { opacity: 0.65; }
+.view-action.agent-wiki-sync[data-sync="conflict"],
+.view-action.agent-wiki-sync[data-sync="unreachable"] { opacity: 1; color: var(--text-warning); }

@@ -1,6 +1,7 @@
 import type * as Y from "yjs";
 import { fingerprint } from "./fingerprint.ts";
 import { NoteSync } from "./NoteSync.ts";
+import type { Facts, Summary } from "../state/syncStatus.ts";
 import type { DiskPort, Hooks, IndexEntry, LiveNote, NoteRecord, RemotePort, StatePort } from "./types.ts";
 
 export type VaultSyncOptions = {
@@ -21,6 +22,8 @@ export type VaultSyncOptions = {
 /** A note's name without what earlier conflicts or clashes added: a copy is always a copy of the note itself. */
 const SUFFIXES = /(?: \((?:conflict [^)]*|local copy(?: \d+)?|\d+)\))+$/;
 export const baseStem = (path: string) => path.replace(/\.md$/, "").replace(SUFFIXES, "");
+/** A conflict copy's name: `<note> (conflict <device> <date time>)`. */
+const CONFLICT = /\(conflict [^)]*\)/;
 const pad = (n: number) => String(n).padStart(2, "0");
 
 /** How many notes are opened (their sync asked of the server) at once while attaching a vault. */
@@ -120,8 +123,55 @@ export class VaultSync {
 		}
 	}
 
+	private statusListeners = new Set<() => void>();
+
+	/** Told whenever what a note's mark is drawn from may have changed (a queue step ended, an edit, an acknowledgement). Returns a way to stop. */
+	onStatus(cb: () => void) {
+		this.statusListeners.add(cb);
+		return () => void this.statusListeners.delete(cb);
+	}
+
+	private emit() {
+		if (this.stopped) return;
+		for (const cb of [...this.statusListeners]) cb();
+	}
+
+	/** Every path the vault knows as a note: the server's index and what this device has attached. */
+	private knownPaths(): Set<string> {
+		const out = new Set(this.byPath.keys());
+		this.remote.index.forEach((e) => {
+			if (!e.deleted) out.add(e.path);
+		});
+		return out;
+	}
+
+	/** What the engine knows about one note, as plain facts; null for a path that is no note of this vault. */
+	facts(path: string): Facts | null {
+		const id = this.byPath.get(path);
+		const n = id ? this.notes.get(id) : undefined;
+		let listed = false;
+		if (id) {
+			const e = this.remote.index.get(id);
+			listed = !!e && !e.deleted;
+		} else this.remote.index.forEach((e) => void (e.path === path && !e.deleted && (listed = true)));
+		if (!id && !listed) return null;
+		const stem = baseStem(path);
+		let conflict = CONFLICT.test(path);
+		if (!conflict) for (const p of this.knownPaths()) if (p !== path && CONFLICT.test(p) && baseStem(p) === stem) conflict = true;
+		return { listed, attached: !!n || (!!id && this.dormant.has(id)), unacked: n?.live.unsynced?.() ?? 0, moving: !!id && this.unsentMoves.has(id), fileBehind: n?.fileBehind ?? false, conflict };
+	}
+
+	/** The vault in two numbers: notes with work outstanding, and conflict copies. */
+	summary(): Summary {
+		let waiting = 0;
+		for (const [id, n] of this.notes) if ((n.live.unsynced?.() ?? 0) > 0 || n.fileBehind || this.unsentMoves.has(id)) waiting++;
+		let conflicts = 0;
+		for (const p of this.knownPaths()) if (CONFLICT.test(p)) conflicts++;
+		return { waiting, conflicts };
+	}
+
 	private enqueue(fn: () => Promise<void>) {
-		this.queue = this.queue.then(fn).catch((e) => this.hooks.log?.("engine error", String(e?.stack ?? e)));
+		this.queue = this.queue.then(fn).catch((e) => this.hooks.log?.("engine error", String(e?.stack ?? e))).then(() => this.emit());
 		return this.queue;
 	}
 
@@ -415,7 +465,9 @@ export class VaultSync {
 			readOnly: this.remote.readOnly,
 			isOpen: this.opts.isOpen ?? (() => false),
 			changed: () => this.saveSoon(),
+			status: () => this.emit(),
 		});
+		live.onUnsynced?.(() => this.emit());
 		this.notes.set(id, n);
 		this.byPath.set(path, id);
 

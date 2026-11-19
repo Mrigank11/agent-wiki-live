@@ -9,6 +9,7 @@ import { EditorBinder } from "./obsidian/editor.ts";
 import { LiveSettingTab } from "./obsidian/settings.ts";
 import { EMPTY, migrateLegacy, NoteFile, type Data, type FileStore } from "./obsidian/noteFile.ts";
 import { VaultDisk } from "./obsidian/vaultDisk.ts";
+import { Indicator } from "./obsidian/indicator.ts";
 
 const http: Http = async (r) => {
 	const res = await requestUrl({ url: r.url, method: r.method, headers: r.headers, body: r.body, throw: false });
@@ -24,6 +25,7 @@ export default class AgentWikiLive extends Plugin {
 	private holder = new SessionHolder();
 	private connector!: Connector;
 	private binder!: EditorBinder;
+	private indicator!: Indicator;
 	private pending: { verifier: string } | null = null;
 
 	async onload() {
@@ -44,18 +46,21 @@ export default class AgentWikiLive extends Plugin {
 			poke: () => this.holder.current?.remote.goOnline(),
 		});
 
+		this.indicator = new Indicator(this.app, () => this.store.get(), () => this.holder.current?.vs ?? null, { reconnect: () => void this.connector.reconnect() }, () => draw());
+		this.register(() => this.indicator.destroy());
 		const status = this.addStatusBarItem();
 		status.addClass("mod-clickable");
 		status.onClickEvent(() => this.openSettings());
 		let was = "";
 		const draw = () => {
 			const s = this.store.get();
-			status.setText(`agent-wiki: ${describeState(s).bar}`);
+			status.setText(`agent-wiki: ${describeState(s).bar}${this.indicator.barExtras()}`);
 			if (s.conn.kind === "stopped" && was !== "stopped") new Notice(`agent-wiki: ${s.conn.reason}`, 15000);
 			was = s.conn.kind;
 		};
-		this.register(this.store.subscribe(draw));
+		this.register(this.store.subscribe(() => (draw(), this.indicator.schedule()))); // the status bar follows the store at once, in step with the settings tab
 		draw();
+		this.indicator.schedule();
 
 		this.binder = new EditorBinder(this.app, () => this.holder.current?.vs ?? null);
 		this.registerEditorExtension(this.binder.extension);
@@ -271,7 +276,8 @@ export default class AgentWikiLive extends Plugin {
 		host.registerEvent(this.app.vault.on("create", (f) => md(f) && void vs.fileCreated(f.path)));
 		host.registerEvent(this.app.vault.on("delete", (f) => md(f) && void vs.fileDeleted(f.path)));
 		host.registerEvent(this.app.vault.on("rename", (f, old) => md(f) && void vs.fileRenamed(old, f.path)));
-		const bind = () => void this.binder.refresh();
+		session.own(vs.onStatus(() => this.indicator.schedule()));
+		const bind = () => void (this.binder.refresh(), this.indicator.schedule());
 		host.registerEvent(this.app.workspace.on("active-leaf-change", bind));
 		host.registerEvent(this.app.workspace.on("file-open", bind));
 		host.registerEvent(this.app.workspace.on("layout-change", bind));

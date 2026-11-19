@@ -49,7 +49,7 @@ export class NoteSync {
 	private enqueue: (fn: () => Promise<void>) => void;
 	/** Keep a person's text that cannot merge as a note of its own. */
 	private keepLocalCopy: (path: string, text: string) => Promise<void>;
-	private opts: { settleMs: number; readOnly: boolean; isOpen: (path: string) => boolean; changed: () => void };
+	private opts: { settleMs: number; readOnly: boolean; isOpen: (path: string) => boolean; changed: () => void; status: () => void };
 
 	constructor(
 		id: string,
@@ -59,7 +59,7 @@ export class NoteSync {
 		hooks: Hooks,
 		enqueue: (fn: () => Promise<void>) => void,
 		keepLocalCopy: (path: string, text: string) => Promise<void>,
-		opts: { settleMs: number; readOnly: boolean; isOpen: (path: string) => boolean; changed: () => void },
+		opts: { settleMs: number; readOnly: boolean; isOpen: (path: string) => boolean; changed: () => void; status: () => void },
 	) {
 		this.id = id;
 		this.live = live;
@@ -74,6 +74,7 @@ export class NoteSync {
 			this.remember();
 			if (tr.origin === ORIGIN_DISK) return;
 			this.scheduleWrite();
+			this.opts.status();
 		};
 		live.text.observe(obs as any);
 		this.off = () => live.text.unobserve(obs as any);
@@ -98,6 +99,11 @@ export class NoteSync {
 
 	get text() {
 		return this.live.text.toString();
+	}
+
+	/** The live text has not been written to the file yet. */
+	get fileBehind() {
+		return this.timer !== null;
 	}
 
 	record(): NoteRecord | null {
