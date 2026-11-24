@@ -1,5 +1,6 @@
 import { HocuspocusProvider, HocuspocusProviderWebsocket } from "@hocuspocus/provider";
 import * as Y from "yjs";
+import { isTransient } from "./gateway.ts";
 import type { IndexEntry, LiveNote, RemotePort } from "../engine/types.ts";
 
 const B32 = "abcdefghijklmnopqrstuvwxyz234567";
@@ -29,6 +30,8 @@ export type RemoteOptions = {
 	WebSocketPolyfill?: unknown;
 	/** Called when the server says live sync is off, or refuses us. */
 	onRefused?: (reason: string) => void;
+	/** Called when the session cannot go on because the network failed (the ticket could not be fetched): not a refusal, try again later. */
+	onNetworkError?: (reason: string) => void;
 	onStatus?: (s: "connecting" | "connected" | "disconnected") => void;
 };
 
@@ -51,6 +54,8 @@ export class HocuspocusRemote implements RemotePort {
 	private syncedOf = new WeakMap<HocuspocusProvider, Promise<void>>();
 	private resyncs = new Set<() => void>();
 	private firstSync = true;
+	/** Why the last ticket fetch failed, until the library's "authentication failed" that follows it is handled. */
+	private tokenFailure: unknown;
 	/** How many notes this connection has opened (a request to the server each): what a reconnect on an unchanged vault should keep at zero. */
 	readonly stats = { opened: 0 };
 
@@ -84,11 +89,24 @@ export class HocuspocusRemote implements RemotePort {
 			websocketProvider: this.socket,
 			name,
 			document: doc,
-			token: () => this.o.token(),
+			token: async () => {
+				try {
+					return await this.o.token();
+				} catch (e) {
+					this.tokenFailure = e; // the library reports this as "authentication failed"; the handler below tells the two apart
+					throw e;
+				}
+			},
 			onSynced: () => done(),
 		} as any);
 		this.syncedOf.set(p, synced);
-		p.on("authenticationFailed", ({ reason }: { reason: string }) => this.o.onRefused?.(reason || "refused by the server"));
+		p.on("authenticationFailed", ({ reason }: { reason: string }) => {
+			const failure = this.tokenFailure;
+			this.tokenFailure = undefined;
+			// the ticket could not be fetched: the server never said no, so a dropped network or a busy server must not end sync
+			if (failure !== undefined && isTransient(failure)) return this.o.onNetworkError?.(reason || String(failure));
+			this.o.onRefused?.(reason || "refused by the server");
+		});
 		if (isIndex)
 			p.on("close", ({ event }: { event?: { code?: number; reason?: string } }) => {
 				if (event?.code === 4403 || /live sync is off/i.test(event?.reason ?? "")) this.o.onRefused?.(event?.reason || "live sync is off for this vault");

@@ -1,6 +1,6 @@
 {
 	"name": "agent-wiki-live",
-	"version": "0.3.2",
+	"version": "0.3.3",
 	"private": true,
 	"description": "agent-wiki Live: Obsidian plugin for live co-editing with an agent-wiki vault.",
 	"main": "main.js",

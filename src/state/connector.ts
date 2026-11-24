@@ -1,4 +1,4 @@
-import { GatewayError, type ProviderInfo, type VaultInfo, type Who as GatewayWho } from "../live/gateway.ts";
+import { GatewayError, isTransient, type ProviderInfo, type VaultInfo, type Who as GatewayWho } from "../live/gateway.ts";
 import { probe } from "../live/signin.ts";
 import type { SessionHolder } from "../engine/LiveSession.ts";
 import type { Phase, Store } from "./connection.ts";
@@ -22,6 +22,8 @@ export type OpenHooks = {
 	live(readOnly: boolean, notes: number): void;
 	socket(up: boolean): void;
 	refused(reason: string): void;
+	/** The network failed under the session (not the server saying no): the connector goes offline and retries on its own backoff. */
+	unreachable(reason: string): void;
 	/** The background attach of notes ended early; the vault is live but not every note is open. */
 	attachFailed(reason: string): void;
 	/** Aborted when this connect is cancelled, refused or superseded: an open that is waiting on the network must give up at once. */
@@ -259,6 +261,7 @@ export class Connector {
 			// the server said no: that is the answer. The open may still be waiting for an index that will never come; end it, and
 			// whatever it then reports (a timeout) is not a network drop
 			refused: (reason) => live(() => { this.refusedGen = gen; this.store.dispatch({ t: "refused", reason }); this.cancelRetry(); void this.teardown(); })(),
+			unreachable: (reason) => live(() => { this.failed(new Error(reason), gen); this.follow(); })(),
 			attachFailed: () => live(() => this.store.dispatch({ t: "attachFailed" }))(),
 			signal,
 		};
@@ -284,7 +287,7 @@ export class Connector {
 	private failed(e: unknown, gen: number) {
 		if (gen !== this.gen || gen === this.refusedGen || e instanceof Cancelled || e instanceof Stop) return;
 		if (e instanceof GatewayError && e.status === 401) return this.signedOut();
-		if (e instanceof Refusal || (e as Error)?.name === "NonEmptyFolderError" || (e instanceof GatewayError && e.status < 500)) {
+		if (e instanceof Refusal || (e as Error)?.name === "NonEmptyFolderError" || (e instanceof GatewayError && !isTransient(e))) {
 			this.store.dispatch({ t: "refused", reason: (e as Error).message });
 			return this.follow();
 		}

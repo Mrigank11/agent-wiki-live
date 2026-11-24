@@ -244,6 +244,7 @@ export default class AgentWikiLive extends Plugin {
 			fileOps: g.fileOps(info.name),
 			readOnly: info.read_only,
 			onRefused: (reason) => hooks.refused(reason),
+			onNetworkError: (reason) => hooks.unreachable(reason),
 			onStatus: (s) => hooks.socket(s === "connected"),
 		});
 		try {

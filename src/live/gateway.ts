@@ -21,6 +21,17 @@ export class GatewayError extends Error {
 	}
 }
 
+/**
+ * Whether a failure to reach or use the server is worth trying again. A dropped network (a laptop waking from sleep:
+ * net::ERR_NETWORK_CHANGED, a DNS or socket failure, a timeout, Tailscale not up yet) and a server that is down, busy or
+ * slow (5xx, 408, 425, 429) are transient. An answer from the server that says no (400, 403, 404, ...) is not; a 401 is
+ * the sign-in ending, which has its own path.
+ */
+export function isTransient(e: unknown): boolean {
+	if (!(e instanceof GatewayError)) return true;
+	return e.status >= 500 || e.status === 408 || e.status === 425 || e.status === 429;
+}
+
 const CSRF = "agent-wiki-admin";
 const API = "/api/app/v1";
 
